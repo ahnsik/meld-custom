@@ -1,5 +1,5 @@
 # Copyright (C) 2002-2005 Stephen Kennedy <stevek@gnome.org>
-# Copyright (C) 2013 Kai Willadsen <kai.willadsen@gmail.com>
+# Copyright (C) 2015 Kai Willadsen <kai.willadsen@gmail.com>
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -22,229 +22,145 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 # THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-import logging
+import errno
 import os
-from gettext import gettext as _
-import re
 import shutil
-import tempfile
-import time
 
-from meld import misc
 from . import _vc
 
 
-class FakeErrorStream(object):
-    def error(self, error):
-        pass
-
-
 class Vc(_vc.Vc):
-    CMD = "cvs"
+
     # CVSNT is a drop-in replacement for CVS; if found, it is used instead
-    ALT_CMD = "cvsnt"
+    CMD = "cvsnt" if shutil.which("cvsnt") else "cvs"
     NAME = "CVS"
     VC_DIR = "CVS"
     VC_ROOT_WALK = False
-    PATCH_STRIP_NUM = 0
-    PATCH_INDEX_RE = "^Index:(.*)$"
 
-    VC_COLUMNS = (_vc.DATA_NAME, _vc.DATA_STATE, _vc.DATA_REVISION,
-                  _vc.DATA_OPTIONS)
+    # According to the output of the 'status' command
+    state_map = {
+        "Unknown":          _vc.STATE_NONE,
+        "Locally Added":    _vc.STATE_NEW,
+        "Up-to-date":       _vc.STATE_NORMAL,
+        "!":                _vc.STATE_MISSING,
+        "I":                _vc.STATE_IGNORED,
+        "Locally Modified": _vc.STATE_MODIFIED,
+        "Locally Removed":  _vc.STATE_REMOVED,
+    }
 
-    def __init__(self, location):
-        super(Vc, self).__init__(location)
-        if not _vc.call(["which", self.ALT_CMD]):
-            self.CMD = self.ALT_CMD
+    def commit(self, runner, files, message):
+        command = [self.CMD, 'commit', '-m', message]
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def commit_command(self, message):
-        return [self.CMD, "commit", "-m", message]
+    def update(self, runner):
+        command = [self.CMD, 'update']
+        runner(command, [], refresh=True, working_dir=self.root)
 
-    def update_command(self):
-        return [self.CMD, "update"]
+    def add(self, runner, afiles):
+        # CVS needs to add files together with all the parents
+        # (if those are Unversioned yet)
+        relfiles = [
+            os.path.relpath(s, self.root)
+            for s in afiles if os.path.isfile(s)
+        ]
+        command = [self.CMD, 'add']
 
-    def add_command(self):
-        return [self.CMD, "add"]
+        relargs = []
+        for f1 in relfiles:
+            positions = [i for i, ch in enumerate(f1 + os.sep) if ch == os.sep]
+            arg1 = [f1[:pos] for pos in positions]
+            relargs += arg1
 
-    def remove_command(self, force=0):
-        return [self.CMD, "rm", "-f"]
+        absargs = [os.path.join(self.root, a1) for a1 in relargs]
+        runner(command, absargs, refresh=True, working_dir=self.root)
 
-    def revert_command(self):
-        return [self.CMD, "update", "-C"]
+    def remove(self, runner, files):
+        command = [self.CMD, 'remove', '-f']
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def valid_repo(self):
-        entry_path = os.path.join(self.root, self.VC_DIR, "Entries")
-        if os.path.exists(entry_path):
-            return True
-        else:
-            return False
+    def revert(self, runner, files):
+        command = [self.CMD, 'update', '-C']
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    @classmethod
+    def valid_repo(cls, path):
+        return not _vc.call([cls.CMD, 'ls'], cwd=path)
 
     def get_path_for_repo_file(self, path, commit=None):
         if commit is not None:
-            raise NotImplementedError
+            raise NotImplementedError()
 
         if not path.startswith(self.root + os.path.sep):
             raise _vc.InvalidVCPath(self, path, "Path not in repository")
         path = path[len(self.root) + 1:]
 
-        diffiter = misc.read_pipe_iter([self.CMD, "diff", "-u", path],
-                                       FakeErrorStream(), workdir=self.root)
-        patch = None
-        while patch is None:
-            patch = next(diffiter)
+        suffix = os.path.splitext(path)[1]
+        args = [self.CMD, "-q", "update", "-p", path]
+        return _vc.call_temp_output(args, cwd=self.root, suffix=suffix)
 
-        tmpdir = tempfile.mkdtemp("-meld")
-        destfile = os.path.join(tmpdir, os.path.basename(path))
+    def _find_files(self, path):
+        relfiles = []
+        loc = os.path.join(self.location, path)
+        for step in os.walk(loc):
+            if not step[0].endswith(self.VC_DIR):
+                ff = [os.path.join(step[0], f1) for f1 in step[2]]
+                relfiles += [os.path.relpath(ff1, loc) for ff1 in ff]
+        return relfiles
 
-        try:
-            shutil.copyfile(os.path.join(self.root, path), destfile)
-        except IOError:
-            # For missing files, create a new empty file
-            open(destfile, "w").close()
-
-        patchcmd = ["patch", "-R", "-d", tmpdir]
-        try:
-            with open(os.devnull, "w") as NULL:
-                result = misc.write_pipe(patchcmd, patch, error=NULL)
-                assert result == 0
-
-            with open(destfile) as patched_file:
-                with tempfile.NamedTemporaryFile(prefix='meld-tmp',
-                                                 delete=False) as temp_file:
-                    shutil.copyfileobj(patched_file, temp_file)
-
-            return temp_file.name
-        except (OSError, AssertionError):
-            return
-        finally:
-            if os.path.exists(destfile):
-                os.remove(destfile)
-            if os.path.exists(destfile):
-                os.rmdir(tmpdir)
-
-    def _get_dirsandfiles(self, directory, dirs, files):
-        log = logging.getLogger(__name__)
-
-        vc_path = os.path.join(directory, self.VC_DIR)
-
-        try:
-            with open(os.path.join(vc_path, "Entries")) as f:
-                entries = f.read()
-            # poor mans universal newline
-            entries = entries.replace("\r", "\n").replace("\n\n", "\n")
-         # No CVS directory
-        except IOError as e:
-            d = [_vc.Dir(x[1], x[0], _vc.STATE_NONE) for x in dirs]
-            f = [_vc.File(x[1], x[0], _vc.STATE_NONE) for x in files]
-            return d, f
-
-        try:
-            with open(os.path.join(vc_path, "Entries.Log")) as f:
-                logentries = f.read()
-        except IOError as e:
-            pass
-        else:
-            matches = re.findall("^([AR])\s*(.+)$(?m)", logentries)
-            toadd = []
-            for match in matches:
-                if match[0] == "A":
-                    toadd.append(match[1])
-                elif match[0] == "R":
-                    try:
-                        toadd.remove(match[1])
-                    except ValueError:
-                        pass
-                else:
-                    log.warning("Unknown Entries.Log line '%s'", match[0])
-            entries += "\n".join(toadd)
-
-        retfiles = []
-        retdirs = []
-        matches = re.findall("^(D?)/([^/]+)/(.+)$(?m)", entries)
-        matches.sort()
-
-        for match in matches:
-            isdir = match[0]
-            name = match[1]
-            path = os.path.join(directory, name)
-            rev, date, options, tag = match[2].split("/")
-            if isdir:
-                if os.path.exists(path):
-                    state = _vc.STATE_NORMAL
-                else:
-                    state = _vc.STATE_MISSING
-                retdirs.append(_vc.Dir(path, name, state))
-            else:
-                if rev.startswith("-"):
-                    state = _vc.STATE_REMOVED
-                elif date == "dummy timestamp":
-                    if rev[0] == "0":
-                        state = _vc.STATE_NEW
-                    else:
-                        state = _vc.STATE_ERROR
-                elif date == "dummy timestamp from new-entry":
-                    state = _vc.STATE_MODIFIED
-                else:
-                    date_sub = lambda x: "%3i" % int(x.group())
-                    date = re.sub(r"\s*\d+", date_sub, date, 1)
-                    plus = date.find("+")
-                    if plus >= 0:
-                        state = _vc.STATE_CONFLICT
-                        try:
-                            txt = open(path, "U").read()
-                        except IOError:
-                            pass
-                        else:
-                            if txt.find("\n=======\n") == -1:
-                                state = _vc.STATE_MODIFIED
-                    else:
-                        try:
-                            mtime = os.stat(path).st_mtime
-                        except OSError:
-                            state = _vc.STATE_MISSING
-                        else:
-                            if time.asctime(time.gmtime(mtime)) == date:
-                                state = _vc.STATE_NORMAL
-                            else:
-                                state = _vc.STATE_MODIFIED
-                retfiles.append(_vc.File(path, name, state, rev, options))
-        # known
-        cvsfiles = [x[1] for x in matches]
-        # ignored
-        try:
-            with open(os.path.join(os.environ["HOME"], ".cvsignore")) as f:
-                ignored = f.read().split()
-        except (IOError, KeyError):
-            ignored = []
-        try:
-            with open(os.path.join(directory, ".cvsignore")) as f:
-                ignored += f.read().split()
-        except IOError:
-            pass
-
-        if len(ignored):
+    def _update_tree_state_cache(self, path):
+        """ Update the state of the file(s) at self._tree_cache['path'] """
+        while 1:
             try:
-                regexes = [misc.shell_to_regex(i)[:-1] for i in ignored]
-                ignore_re = re.compile("(" + "|".join(regexes) + ")")
-            except re.error as e:
-                misc.run_dialog(_("Error converting to a regular expression\n"
-                                  "The pattern was '%s'\nThe error was '%s'") %
-                                (",".join(ignored), e))
+                # Get the status of files
+
+                path_isdir = os.path.isdir(path)
+                files = self._find_files(path) if path_isdir else [path]
+
+                # Should suppress stderr here
+                proc = _vc.popen(
+                    [self.CMD, "-Q", "status"] + files,
+                    cwd=self.location,
+                )
+                entries = [
+                    li for li in proc.read().splitlines()
+                    if li.startswith('File:')
+                ]
+                break
+            except OSError as e:
+                if e.errno != errno.EAGAIN:
+                    raise
+
+        if len(entries) == 0 and os.path.isfile(path):
+            # If we're just updating a single file there's a chance that
+            # it was previously modified, and now has been edited so that
+            # it is un-modified.  This will result in an empty 'entries' list,
+            # and self._tree_cache['path'] will still contain stale data.
+            # When this corner case occurs we force self._tree_cache['path']
+            # to STATE_NORMAL.
+            self._tree_cache[path] = _vc.STATE_NORMAL
         else:
-            class dummy(object):
-                def match(self, *args):
-                    return None
-            ignore_re = dummy()
+            # There are 1 or more [modified] files, parse their state
+            for entry in zip(files, entries):
+                statekey = entry[1].split(':')[-1].strip()
+                name = entry[0].strip()
 
-        for f, path in files:
-            if f not in cvsfiles:
-                state = (ignore_re.match(f) is None and _vc.STATE_NONE or
-                         _vc.STATE_IGNORED)
-                retfiles.append(_vc.File(path, f, state))
-        for d, path in dirs:
-            if d not in cvsfiles:
-                state = (ignore_re.match(d) is None and _vc.STATE_NONE or
-                         _vc.STATE_IGNORED)
-                retdirs.append(_vc.Dir(path, d, state))
+                if os.path.basename(name) not in entry[1]:
+                    # ? The short filename got from
+                    # 'cvs -Q status <path/file>' does not match <file>
+                    raise
 
-        return retdirs, retfiles
+                path = os.path.join(self.location, name)
+                state = self.state_map.get(statekey, _vc.STATE_NONE)
+                self._tree_cache[path] = state
+                self._add_missing_cache_entry(path, state)
+
+        """
+        # Setting the state of dirs also might be relevant, but not sure
+        # Heuristic to find out the state ('CVS' subdir exists or not)
+        for entry in zip(dirs, [os.path.isdir(os.path.join(d1, self.VC_DIR))
+                                for d1 in dirs]):
+            path = os.path.join(self.location, entry[0])
+            state = _vc.STATE_NORMAL if entry[1] else _vc.STATE_NONE
+            self._tree_cache[path] = state
+            self._add_missing_cache_entry(path, state)
+        """

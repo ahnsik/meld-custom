@@ -1,56 +1,61 @@
-### Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
-### Copyright (C) 2009-2012 Kai Willadsen <kai.willadsen@gmail.com>
-
-### This program is free software; you can redistribute it and/or modify
-### it under the terms of the GNU General Public License as published by
-### the Free Software Foundation; either version 2 of the License, or
-### (at your option) any later version.
-
-### This program is distributed in the hope that it will be useful,
-### but WITHOUT ANY WARRANTY; without even the implied warranty of
-### MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-### GNU General Public License for more details.
-
-### You should have received a copy of the GNU General Public License
-### along with this program; if not, write to the Free Software
-### Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
-### USA.
+# Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2009-2019 Kai Willadsen <kai.willadsen@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import collections
 import copy
-import datetime
 import errno
+import functools
+import logging
 import os
-import re
 import shutil
 import stat
 import sys
-import time
-
-import gtk
-import gtk.keysyms
-
-from . import melddoc
-from . import tree
-from . import misc
-from . import paths
-from . import recent
-from .ui import gnomeglade
-from .ui import emblemcellrenderer
-
+import typing
+import unicodedata
 from collections import namedtuple
 from decimal import Decimal
-from gettext import gettext as _
-from gettext import ngettext
-from .meldapp import app
+from mmap import ACCESS_COPY, mmap
+from typing import DefaultDict, List, NamedTuple, Optional, Tuple
 
-gdk = gtk.gdk
+from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
-################################################################################
-#
-# Local Functions
-#
-################################################################################
+# TODO: Don't from-import whole modules
+from meld import misc, tree
+from meld.conf import _
+from meld.const import FILE_FILTER_ACTION_FORMAT, MISSING_TIMESTAMP
+from meld.iohelpers import find_shared_parent_path, trash_or_confirm
+from meld.melddoc import MeldDoc, open_files_external
+from meld.misc import all_same, apply_text_filters, with_focused_pane
+from meld.recent import RecentType
+from meld.settings import bind_settings, get_meld_settings, settings
+from meld.treehelpers import refocus_deleted_path, tree_path_as_tuple
+from meld.ui.cellrenderers import (
+    CellRendererByteSize,
+    CellRendererDate,
+    CellRendererFileMode,
+    CellRendererISODate,
+)
+from meld.ui.emblemcellrenderer import EmblemCellRenderer
+from meld.ui.util import map_widgets_into_lists
+
+if typing.TYPE_CHECKING:
+    from meld.ui.pathlabel import PathLabel
+
+log = logging.getLogger(__name__)
+
 
 class StatItem(namedtuple('StatItem', 'mode size time')):
     __slots__ = ()
@@ -60,7 +65,7 @@ class StatItem(namedtuple('StatItem', 'mode size time')):
         return StatItem(stat.S_IFMT(stat_result.st_mode),
                         stat_result.st_size, stat_result.st_mtime)
 
-    def shallow_equal(self, other, prefs):
+    def shallow_equal(self, other, time_resolution_ns):
         if self.size != other.size:
             return False
 
@@ -69,10 +74,10 @@ class StatItem(namedtuple('StatItem', 'mode size time')):
         if abs(self.time - other.time) > 2:
             return False
 
-        dectime1 = Decimal(str(self.time)).scaleb(Decimal(9)).quantize(1)
-        dectime2 = Decimal(str(other.time)).scaleb(Decimal(9)).quantize(1)
-        mtime1 = dectime1 // prefs.dirdiff_time_resolution_ns
-        mtime2 = dectime2 // prefs.dirdiff_time_resolution_ns
+        dectime1 = Decimal(self.time).scaleb(Decimal(9)).quantize(1)
+        dectime2 = Decimal(other.time).scaleb(Decimal(9)).quantize(1)
+        mtime1 = dectime1 // time_resolution_ns
+        mtime2 = dectime2 // time_resolution_ns
 
         return mtime1 == mtime2
 
@@ -81,25 +86,77 @@ CacheResult = namedtuple('CacheResult', 'stats result')
 
 
 _cache = {}
-Same, SameFiltered, DodgySame, DodgyDifferent, Different, FileError = \
-    list(range(6))
+Same, SameFiltered, DodgySame, DodgyDifferent, Different, FileError = (
+    list(range(6)))
 # TODO: Get the block size from os.stat
 CHUNK_SIZE = 4096
 
 
-def all_same(lst):
-    return not lst or lst.count(lst[0]) == len(lst)
-
-
 def remove_blank_lines(text):
-    splits = text.splitlines()
-    lines = text.splitlines(True)
-    blanks = set([i for i, l in enumerate(splits) if not l])
-    lines = [l for i, l in enumerate(lines) if i not in blanks]
-    return ''.join(lines)
+    """
+    Remove blank lines from text.
+    And normalize line ending
+    """
+    return b'\n'.join(filter(bool, text.splitlines()))
 
 
-def _files_same(files, regexes, prefs):
+def _files_contents(files, stats):
+    mmaps = []
+    is_bin = False
+    contents = [b'' for file_obj in files]
+
+    for index, file_and_stat in enumerate(zip(files, stats)):
+        file_obj, stat_ = file_and_stat
+        # use mmap for files with size > CHUNK_SIZE
+        data = b''
+        if stat_.size > CHUNK_SIZE:
+            data = mmap(file_obj.fileno(), 0, access=ACCESS_COPY)
+            mmaps.append(data)
+        else:
+            data = file_obj.read()
+        contents[index] = data
+
+        # Rough test to see whether files are binary.
+        chunk_size = min([stat_.size, CHUNK_SIZE])
+        if b"\0" in data[:chunk_size]:
+            is_bin = True
+
+    return contents, mmaps, is_bin
+
+
+def _contents_same(contents, file_size):
+    other_files_index = list(range(1, len(contents)))
+    chunk_range = zip(
+        range(0, file_size, CHUNK_SIZE),
+        range(CHUNK_SIZE, file_size + CHUNK_SIZE, CHUNK_SIZE),
+    )
+
+    for start, end in chunk_range:
+        chunk = contents[0][start:end]
+        for index in other_files_index:
+            if not chunk == contents[index][start:end]:
+                return Different
+
+
+def _normalize(contents, ignore_blank_lines, regexes=()):
+    contents = (bytes(c) for c in contents)
+    # For probable text files, discard newline differences to match
+    if ignore_blank_lines:
+        contents = (remove_blank_lines(c) for c in contents)
+    else:
+        contents = (b"\n".join(c.splitlines()) for c in contents)
+
+    if regexes:
+        contents = (apply_text_filters(c, regexes) for c in contents)
+        if ignore_blank_lines:
+            # We re-remove blank lines here in case applying text
+            # filters has caused more lines to be blank.
+            contents = (remove_blank_lines(c) for c in contents)
+
+    return contents
+
+
+def _files_same(files, regexes, comparison_args):
     """Determine whether a list of files are the same.
 
     Possible results are:
@@ -110,15 +167,20 @@ def _files_same(files, regexes, prefs):
       FileError: There was a problem reading one or more of the files
     """
 
-    # One file is the same as itself
-    if len(files) < 2:
+    if all_same(files):
         return Same
 
     files = tuple(files)
-    regexes = tuple(regexes)
     stats = tuple([StatItem._make(os.stat(f)) for f in files])
 
-    need_contents = regexes or prefs.ignore_blank_lines
+    shallow_comparison = comparison_args['shallow-comparison']
+    time_resolution_ns = comparison_args['time-resolution']
+    ignore_blank_lines = comparison_args['ignore_blank_lines']
+    apply_text_filters = comparison_args['apply-text-filters']
+
+    need_contents = ignore_blank_lines or apply_text_filters
+
+    regexes = tuple(regexes) if apply_text_filters else ()
 
     # If all entries are directories, they are considered to be the same
     if all([stat.S_ISDIR(s.mode) for s in stats]):
@@ -129,55 +191,49 @@ def _files_same(files, regexes, prefs):
         return Different
 
     # Compare files superficially if the options tells us to
-    if prefs.dirdiff_shallow_comparison:
-        if all(s.shallow_equal(stats[0], prefs) for s in stats[1:]):
-            return DodgySame
-        else:
-            return Different
+    if shallow_comparison:
+        all_same_timestamp = all(
+            s.shallow_equal(stats[0], time_resolution_ns) for s in stats[1:]
+        )
+        return DodgySame if all_same_timestamp else Different
 
+    same_size = all_same([s.size for s in stats])
     # If there are no text filters, unequal sizes imply a difference
-    if not need_contents and not all_same([s.size for s in stats]):
+    if not need_contents and not same_size:
         return Different
 
     # Check the cache before doing the expensive comparison
-    cache_key = (files, regexes, prefs.ignore_blank_lines)
+    cache_key = (files, need_contents, regexes, ignore_blank_lines)
     cache = _cache.get(cache_key)
     if cache and cache.stats == stats:
         return cache.result
 
     # Open files and compare bit-by-bit
-    contents = [[] for f in files]
     result = None
 
     try:
-        handles = [open(f, "rb") for f in files]
+        mmaps = []
+        handles = [open(file_path, "rb") for file_path in files]
         try:
-            data = [h.read(CHUNK_SIZE) for h in handles]
+            contents, mmaps, is_bin = _files_contents(handles, stats)
 
-            # Rough test to see whether files are binary. If files are guessed
-            # to be binary, we don't examine contents for speed and space.
-            if any(["\0" in d for d in data]):
-                need_contents = False
+            # compare files chunk-by-chunk
+            if same_size:
+                result = _contents_same(contents, stats[0].size)
+            else:
+                result = Different
 
-            while True:
-                if all_same(data):
-                    if not data[0]:
-                        break
-                else:
-                    result = Different
-                    if not need_contents:
-                        break
-
-                if need_contents:
-                    for i in range(len(data)):
-                        contents[i].append(data[i])
-
-                data = [h.read(CHUNK_SIZE) for h in handles]
+            # normalize and compare files again
+            if result == Different and need_contents and not is_bin:
+                contents = _normalize(contents, ignore_blank_lines, regexes)
+                result = SameFiltered if all_same(contents) else Different
 
         # Files are too large; we can't apply filters
         except (MemoryError, OverflowError):
             result = DodgySame if all_same(stats) else DodgyDifferent
         finally:
+            for m in mmaps:
+                m.close()
             for h in handles:
                 h.close()
     except IOError:
@@ -187,205 +243,421 @@ def _files_same(files, regexes, prefs):
     if result is None:
         result = Same
 
-    if result == Different and need_contents:
-        contents = ["".join(c) for c in contents]
-        for r in regexes:
-            contents = [re.sub(r, "", c) for c in contents]
-        if prefs.ignore_blank_lines:
-            contents = [remove_blank_lines(c) for c in contents]
-        result = SameFiltered if all_same(contents) else Different
-
     _cache[cache_key] = CacheResult(stats, result)
     return result
 
 
-COL_EMBLEM, COL_SIZE, COL_TIME, COL_PERMS, COL_END = \
-        range(tree.COL_END, tree.COL_END + 5)
+EMBLEM_NEW = "emblem-new"
+EMBLEM_SELECTED = "emblem-default-symbolic"
+EMBLEM_SYMLINK = "emblem-symbolic-link"
+
+COL_EMBLEM, COL_EMBLEM_SECONDARY, COL_SIZE, COL_TIME, COL_PERMS, COL_END = (
+    range(tree.COL_END, tree.COL_END + 6))
 
 
 class DirDiffTreeStore(tree.DiffTreeStore):
     def __init__(self, ntree):
-        tree.DiffTreeStore.__init__(self, ntree, [str, str, str, str])
+        # FIXME: size should be a GObject.TYPE_UINT64, but we use -1 as a flag
+        super().__init__(ntree, [str, str, GObject.TYPE_INT64, float, int])
+
+    def add_error(self, parent, msg, pane):
+        defaults = {
+            COL_TIME: MISSING_TIMESTAMP,
+            COL_SIZE: -1,
+            COL_PERMS: -1,
+        }
+        super().add_error(parent, msg, pane, defaults)
 
 
-class CanonicalListing(object):
+class ComparisonOptions:
+    def __init__(
+        self,
+        *,
+        ignore_case: bool = False,
+        normalize_encoding: bool = False,
+    ):
+        self.ignore_case = ignore_case
+        self.normalize_encoding = normalize_encoding
+
+
+class CanonicalListing:
     """Multi-pane lists with canonicalised matching and error detection"""
 
-    def __init__(self, n, canonicalize=None):
+    items: DefaultDict[str, List[Optional[str]]]
+    errors: List[Tuple[int, str, str]]
+
+    def __init__(self, n: int, options: ComparisonOptions):
         self.items = collections.defaultdict(lambda: [None] * n)
         self.errors = []
-        if canonicalize is not None:
-            self.canonicalize = canonicalize
-            self.add = self.add_canon
+        self.options = options
 
-    def add(self, pane, item):
-        self.items[item][pane] = item
+    def add(self, pane: int, item: str):
+        # normalize the name depending on settings
+        ci = item
+        if self.options.ignore_case:
+            ci = ci.lower()
+        if self.options.normalize_encoding:
+            # NFC or NFD will work here, changing all composed or decomposed
+            # characters to the same set for matching only.
+            ci = unicodedata.normalize('NFC', ci)
 
-    def add_canon(self, pane, item):
-        ci = self.canonicalize(item)
-        if self.items[ci][pane] is None:
+        # add the item to the comparison tree
+        existing_item = self.items[ci][pane]
+        if existing_item is None:
             self.items[ci][pane] = item
         else:
-            self.errors.append((pane, item, self.items[ci][pane]))
+            self.errors.append((pane, item, existing_item))
 
     def get(self):
-        first = lambda seq: next(s for s in seq if s)
-        filled = lambda seq: tuple([s or first(seq) for s in seq])
+        def filled(seq):
+            fill_value = next(s for s in seq if s)
+            return tuple(s or fill_value for s in seq)
+
         return sorted(filled(v) for v in self.items.values())
 
 
-################################################################################
-#
-# DirDiff
-#
-################################################################################
+class ComparisonMarker(NamedTuple):
+    """A stable row + pane marker
 
-class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
-    """Two or three way diff of directories"""
+    This marker is used for selecting a specific file or folder when
+    the user wants to compare paths that don't have matching names, and
+    so aren't aligned in our tree view.
+    """
 
-    """Dictionary mapping tree states to corresponding difflib-like terms"""
-    chunk_type_map = {
-        tree.STATE_NORMAL: None,
-        tree.STATE_NOCHANGE: None,
-        tree.STATE_NEW: "insert",
-        tree.STATE_ERROR: "error",
-        tree.STATE_EMPTY: None,
-        tree.STATE_MODIFIED: "replace",
-        tree.STATE_MISSING: "delete",
-        tree.STATE_NONEXIST: "delete",
-    }
+    pane: int
+    row: Gtk.TreeRowReference
+
+    def get_iter(self) -> Gtk.TreeIter:
+        return self.row.get_model().get_iter(self.row.get_path())
+
+    def matches_iter(self, pane: int, it: Gtk.TreeIter) -> bool:
+        return (
+            pane == self.pane and
+            self.row.get_model().get_path(it) == self.row.get_path()
+        )
+
+    @classmethod
+    def from_selection(
+        cls,
+        treeview: Gtk.TreeView,
+        pane: int,
+    ) -> "ComparisonMarker":
+
+        if pane is None or pane == -1:
+            raise ValueError("Invalid pane for marker")
+
+        model = treeview.get_model()
+        _, selected_paths = treeview.get_selection().get_selected_rows()
+
+        # We'll assume that in any multi-select, the first row was the
+        # intended mark.
+        selected_row = Gtk.TreeRowReference.new(model, selected_paths[0])
+
+        return cls(
+            pane=pane,
+            row=selected_row,
+        )
+
+
+@Gtk.Template(resource_path='/org/gnome/meld/ui/dirdiff.ui')
+class DirDiff(Gtk.VBox, tree.TreeviewCommon, MeldDoc):
+
+    __gtype_name__ = "DirDiff"
+
+    close_signal = MeldDoc.close_signal
+    create_diff_signal = MeldDoc.create_diff_signal
+    file_changed_signal = MeldDoc.file_changed_signal
+    label_changed = MeldDoc.label_changed
+    move_diff = MeldDoc.move_diff
+    tab_state_changed = MeldDoc.tab_state_changed
+
+    __gsettings_bindings__ = (
+        ('folder-ignore-symlinks', 'ignore-symlinks'),
+        ('folder-shallow-comparison', 'shallow-comparison'),
+        ('folder-time-resolution', 'time-resolution'),
+        ('folder-status-filters', 'status-filters'),
+        ('folder-filter-text', 'apply-text-filters'),
+        ('ignore-blank-lines', 'ignore-blank-lines'),
+    )
+
+    apply_text_filters = GObject.Property(
+        type=bool,
+        nick="Apply text filters",
+        blurb=(
+            "Whether text filters and other text sanitisation preferences "
+            "should be applied when comparing file contents"),
+        default=False,
+    )
+    folders: List[Optional[Gio.File]] = GObject.Property(
+        type=object,
+        nick="Folders being compared",
+        blurb="List of folders being compared, as GFiles",
+    )
+    ignore_blank_lines = GObject.Property(
+        type=bool,
+        nick="Ignore blank lines",
+        blurb="Whether to ignore blank lines when comparing file contents",
+        default=False,
+    )
+    ignore_symlinks = GObject.Property(
+        type=bool,
+        nick="Ignore symbolic links",
+        blurb="Whether to follow symbolic links when comparing folders",
+        default=False,
+    )
+    shallow_comparison = GObject.Property(
+        type=bool,
+        nick="Use shallow comparison",
+        blurb="Whether to compare files based solely on size and mtime",
+        default=False,
+    )
+    status_filters = GObject.Property(
+        type=GObject.TYPE_STRV,
+        nick="File status filters",
+        blurb="Files with these statuses will be shown by the comparison.",
+    )
+    time_resolution = GObject.Property(
+        type=int,
+        nick="Time resolution",
+        blurb="When comparing based on mtime, the minimum difference in "
+              "nanoseconds between two files before they're considered to "
+              "have different mtimes.",
+        default=100,
+    )
+
+    show_overview_map = GObject.Property(type=bool, default=True)
+
+    chunkmap0 = Gtk.Template.Child()
+    chunkmap1 = Gtk.Template.Child()
+    chunkmap2 = Gtk.Template.Child()
+    folder_label: 'List[PathLabel]'
+    folder_label0 = Gtk.Template.Child()
+    folder_label1 = Gtk.Template.Child()
+    folder_label2 = Gtk.Template.Child()
+    folder_open_button0 = Gtk.Template.Child()
+    folder_open_button1 = Gtk.Template.Child()
+    folder_open_button2 = Gtk.Template.Child()
+    treeview0 = Gtk.Template.Child()
+    treeview1 = Gtk.Template.Child()
+    treeview2 = Gtk.Template.Child()
+    scrolledwindow0 = Gtk.Template.Child()
+    scrolledwindow1 = Gtk.Template.Child()
+    scrolledwindow2 = Gtk.Template.Child()
+    linkmap0 = Gtk.Template.Child()
+    linkmap1 = Gtk.Template.Child()
+    msgarea_mgr0 = Gtk.Template.Child()
+    msgarea_mgr1 = Gtk.Template.Child()
+    msgarea_mgr2 = Gtk.Template.Child()
+    overview_map_revealer = Gtk.Template.Child()
+    pane_actionbar0 = Gtk.Template.Child()
+    pane_actionbar1 = Gtk.Template.Child()
+    pane_actionbar2 = Gtk.Template.Child()
+    vbox0 = Gtk.Template.Child()
+    vbox1 = Gtk.Template.Child()
+    vbox2 = Gtk.Template.Child()
+    dummy_toolbar_linkmap0 = Gtk.Template.Child()
+    dummy_toolbar_linkmap1 = Gtk.Template.Child()
+    toolbar_sourcemap_revealer = Gtk.Template.Child()
 
     state_actions = {
-        tree.STATE_NORMAL: ("normal", "ShowSame"),
-        tree.STATE_NEW: ("new", "ShowNew"),
-        tree.STATE_MODIFIED: ("modified", "ShowModified"),
+        tree.STATE_NORMAL: ("normal", "folder-status-same"),
+        tree.STATE_NOCHANGE: ("normal", "folder-status-same"),
+        tree.STATE_NEW: ("new", "folder-status-new"),
+        tree.STATE_MODIFIED: ("modified", "folder-status-modified"),
     }
 
-    def __init__(self, prefs, num_panes):
-        melddoc.MeldDoc.__init__(self, prefs)
-        gnomeglade.Component.__init__(self, paths.ui_dir("dirdiff.ui"), "dirdiff")
+    def __init__(self, num_panes):
+        super().__init__()
+        # FIXME:
+        # This unimaginable hack exists because GObject (or GTK+?)
+        # doesn't actually correctly chain init calls, even if they're
+        # not to GObjects. As a workaround, we *should* just be able to
+        # put our class first, but because of Gtk.Template we can't do
+        # that if it's a GObject, because GObject doesn't support
+        # multiple inheritance and we need to inherit from our Widget
+        # parent to make Template work.
+        MeldDoc.__init__(self)
+        bind_settings(self)
+
+        self.view_action_group = Gio.SimpleActionGroup()
+
+        property_actions = (
+            ('show-overview-map', self, 'show-overview-map'),
+        )
+        for action_name, obj, prop_name in property_actions:
+            action = Gio.PropertyAction.new(action_name, obj, prop_name)
+            self.view_action_group.add_action(action)
+
+        # Manually handle GAction additions
+        actions = (
+            ('find', self.action_find),
+            ('folder-collapse', self.action_folder_collapse),
+            ('folder-compare', self.action_diff),
+            ('folder-mark', self.action_mark),
+            ('folder-compare-marked', self.action_diff_marked),
+            ('folder-copy-left', self.action_copy_left),
+            ('folder-copy-right', self.action_copy_right),
+            ('folder-copy-left-next', self.action_copy_left_next),
+            ('folder-copy-right-next', self.action_copy_right_next),
+            ('swap-2-panes', self.action_swap),
+            ('folder-delete', self.action_delete),
+            ('folder-expand', self.action_folder_expand),
+            ('next-change', self.action_next_change),
+            ('next-pane', self.action_next_pane),
+            ('open-external', self.action_open_external),
+            ('previous-change', self.action_previous_change),
+            ('previous-pane', self.action_prev_pane),
+            ('refresh', self.action_refresh),
+            ('copy-file-paths', self.action_copy_file_paths),
+        )
+        for name, callback in actions:
+            action = Gio.SimpleAction.new(name, None)
+            action.connect('activate', callback)
+            self.view_action_group.add_action(action)
 
         actions = (
-            ("DirCompare",   gtk.STOCK_DIALOG_INFO,  _("_Compare"), None, _("Compare selected"), self.on_button_diff_clicked),
-            ("DirCopyLeft",  gtk.STOCK_GO_BACK,      _("Copy _Left"),     "<Alt>Left", _("Copy to left"), self.on_button_copy_left_clicked),
-            ("DirCopyRight", gtk.STOCK_GO_FORWARD,   _("Copy _Right"),    "<Alt>Right", _("Copy to right"), self.on_button_copy_right_clicked),
-            ("DirDelete",    gtk.STOCK_DELETE,        None,         "Delete", _("Delete selected"), self.on_button_delete_clicked),
-            ("Hide",         gtk.STOCK_NO,           _("Hide"),     None, _("Hide selected"), self.on_filter_hide_current_clicked),
+            ("folder-status-same", self.action_filter_state_change,
+                GLib.Variant.new_boolean(False)),
+            ("folder-status-new", self.action_filter_state_change,
+                GLib.Variant.new_boolean(False)),
+            ("folder-status-modified", self.action_filter_state_change,
+                GLib.Variant.new_boolean(False)),
+            ("folder-ignore-case", self.action_ignore_case_change,
+                GLib.Variant.new_boolean(False)),
+            ("folder-normalize-encoding", self.action_ignore_case_change,
+                GLib.Variant.new_boolean(False)),
         )
+        for (name, callback, state) in actions:
+            action = Gio.SimpleAction.new_stateful(name, None, state)
+            action.connect('change-state', callback)
+            self.view_action_group.add_action(action)
 
-        toggleactions = (
-            ("IgnoreCase",   gtk.STOCK_ITALIC,  _("Ignore Filename Case"), None, _("Consider differently-cased filenames that are otherwise-identical to be the same"), self.on_button_ignore_case_toggled, False),
-            ("ShowSame",     gtk.STOCK_APPLY,   _("Same"),     None, _("Show identical"), self.on_filter_state_toggled, False),
-            ("ShowNew",      gtk.STOCK_ADD,     _("New"),      None, _("Show new"), self.on_filter_state_toggled, False),
-            ("ShowModified", gtk.STOCK_REMOVE,  _("Modified"), None, _("Show modified"), self.on_filter_state_toggled, False),
+        builder = Gtk.Builder.new_from_resource(
+            '/org/gnome/meld/ui/dirdiff-menus.ui')
+        context_menu = builder.get_object('dirdiff-context-menu')
+        self.popup_menu = Gtk.Menu.new_from_model(context_menu)
+        self.popup_menu.attach_to_widget(self)
 
-            ("CustomFilterMenu", None, _("Filters"), None, _("Set active filters"), self.on_custom_filter_menu_toggled, False),
-        )
-        self.ui_file = paths.ui_dir("dirdiff-ui.xml")
-        self.actiongroup = gtk.ActionGroup('DirdiffToolbarActions')
-        self.actiongroup.set_translation_domain("meld")
-        self.actiongroup.add_actions(actions)
-        self.actiongroup.add_toggle_actions(toggleactions)
-        self.main_actiongroup = None
+        builder = Gtk.Builder.new_from_resource(
+            '/org/gnome/meld/ui/dirdiff-actions.ui')
+        self.toolbar_actions = builder.get_object('view-toolbar')
+
+        self.folders = [None, None, None]
 
         self.name_filters = []
         self.text_filters = []
         self.create_name_filters()
         self.create_text_filters()
-        self.app_handlers = [app.connect("file-filters-changed",
-                                         self.on_file_filters_changed),
-                             app.connect("text-filters-changed",
-                                         self.on_text_filters_changed)]
+        meld_settings = get_meld_settings()
+        self.settings_handlers = [
+            meld_settings.connect(
+                "file-filters-changed", self.on_file_filters_changed),
+            meld_settings.connect(
+                "text-filters-changed", self.on_text_filters_changed)
+        ]
 
-        for button in ("DirCompare", "DirCopyLeft", "DirCopyRight",
-                       "DirDelete", "ShowSame",
-                       "ShowNew", "ShowModified", "CustomFilterMenu"):
-            self.actiongroup.get_action(button).props.is_important = True
-        self.map_widgets_into_lists(["treeview", "fileentry", "scrolledwindow",
-                                     "diffmap", "linkmap", "msgarea_mgr",
-                                     "vbox"])
+        # Handle overview map visibility binding. Because of how we use
+        # grid packing, we need two revealers here instead of the more
+        # obvious one.
+        revealers = (
+            self.toolbar_sourcemap_revealer,
+            self.overview_map_revealer,
+        )
+        for revealer in revealers:
+            self.bind_property(
+                'show-overview-map', revealer, 'reveal-child',
+                (
+                    GObject.BindingFlags.DEFAULT |
+                    GObject.BindingFlags.SYNC_CREATE
+                ),
+            )
 
-        self.widget.ensure_style()
-        self.on_style_set(self.widget, None)
-        self.widget.connect("style-set", self.on_style_set)
+        map_widgets_into_lists(
+            self,
+            [
+                "treeview", "folder_label", "scrolledwindow", "chunkmap",
+                "linkmap", "msgarea_mgr", "vbox", "dummy_toolbar_linkmap",
+                "pane_actionbar", "folder_open_button",
+            ],
+        )
+
+        self.ensure_style()
 
         self.custom_labels = []
         self.set_num_panes(num_panes)
 
-        self.widget.connect("style-set", self.model.on_style_set)
+        self.connect("style-updated", self.model.on_style_updated)
+        self.model.on_style_updated(self)
 
         self.do_to_others_lock = False
-        self.focus_in_events = []
-        self.focus_out_events = []
         for treeview in self.treeview:
-            handler_id = treeview.connect("focus-in-event", self.on_treeview_focus_in_event)
-            self.focus_in_events.append(handler_id)
-            handler_id = treeview.connect("focus-out-event", self.on_treeview_focus_out_event)
-            self.focus_out_events.append(handler_id)
-            treeview.set_search_equal_func(self.model.treeview_search_cb)
+            treeview.set_search_equal_func(tree.treeview_search_cb, None)
+        self.force_cursor_recalculate = False
         self.current_path, self.prev_path, self.next_path = None, None, None
-        self.on_treeview_focus_out_event(None, None)
         self.focus_pane = None
-
-        lastchanged_label = gtk.Label()
-        lastchanged_label.set_size_request(100, -1)
-        lastchanged_label.show()
-        permissions_label = gtk.Label()
-        permissions_label.set_size_request(100, -1)
-        permissions_label.show()
-        self.status_info_labels = [lastchanged_label, permissions_label]
+        self.row_expansions = set()
 
         # One column-dict for each treeview, for changing visibility and order
         self.columns_dict = [{}, {}, {}]
         for i in range(3):
             col_index = self.model.column_index
             # Create icon and filename CellRenderer
-            column = gtk.TreeViewColumn(_("Name"))
+            column = Gtk.TreeViewColumn(_("Name"))
             column.set_resizable(True)
-            rentext = gtk.CellRendererText()
-            renicon = emblemcellrenderer.EmblemCellRenderer()
-            column.pack_start(renicon, expand=0)
-            column.pack_start(rentext, expand=1)
-            column.set_attributes(rentext, text=col_index(tree.COL_TEXT, i),
-                                  foreground_gdk=col_index(tree.COL_FG, i),
+            rentext = Gtk.CellRendererText()
+            renicon = EmblemCellRenderer()
+            column.pack_start(renicon, False)
+            column.pack_start(rentext, True)
+            column.set_attributes(rentext, markup=col_index(tree.COL_TEXT, i),
+                                  foreground_rgba=col_index(tree.COL_FG, i),
                                   style=col_index(tree.COL_STYLE, i),
                                   weight=col_index(tree.COL_WEIGHT, i),
                                   strikethrough=col_index(tree.COL_STRIKE, i))
-            column.set_attributes(renicon,
-                                  icon_name=col_index(tree.COL_ICON, i),
-                                  emblem_name=col_index(COL_EMBLEM, i),
-                                  icon_tint=col_index(tree.COL_TINT, i))
+            column.set_attributes(
+                renicon,
+                icon_name=col_index(tree.COL_ICON, i),
+                emblem_name=col_index(COL_EMBLEM, i),
+                secondary_emblem_name=col_index(COL_EMBLEM_SECONDARY, i),
+                icon_tint=col_index(tree.COL_TINT, i)
+            )
             self.treeview[i].append_column(column)
             self.columns_dict[i]["name"] = column
             # Create file size CellRenderer
-            column = gtk.TreeViewColumn(_("Size"))
+            column = Gtk.TreeViewColumn(_("Size"))
             column.set_resizable(True)
-            rentext = gtk.CellRendererText()
-            column.pack_start(rentext, expand=1)
-            column.set_attributes(rentext, markup=col_index(COL_SIZE, i))
+            rentext = CellRendererByteSize()
+            column.pack_start(rentext, True)
+            column.set_attributes(rentext, bytesize=col_index(COL_SIZE, i))
             self.treeview[i].append_column(column)
             self.columns_dict[i]["size"] = column
             # Create date-time CellRenderer
-            column = gtk.TreeViewColumn(_("Modification time"))
+            column = Gtk.TreeViewColumn(_("Modification time"))
             column.set_resizable(True)
-            rentext = gtk.CellRendererText()
-            column.pack_start(rentext, expand=1)
-            column.set_attributes(rentext, markup=col_index(COL_TIME, i))
+            rentext = CellRendererDate()
+            column.pack_start(rentext, True)
+            column.set_attributes(rentext, timestamp=col_index(COL_TIME, i))
             self.treeview[i].append_column(column)
             self.columns_dict[i]["modification time"] = column
-            # Create permissions CellRenderer
-            column = gtk.TreeViewColumn(_("Permissions"))
+            # Create ISO-format date-time CellRenderer
+            column = Gtk.TreeViewColumn(_("Modification time (ISO)"))
             column.set_resizable(True)
-            rentext = gtk.CellRendererText()
-            column.pack_start(rentext, expand=0)
-            column.set_attributes(rentext, markup=col_index(COL_PERMS, i))
+            rentext = CellRendererISODate()
+            column.pack_start(rentext, True)
+            column.set_attributes(rentext, timestamp=col_index(COL_TIME, i))
+            self.treeview[i].append_column(column)
+            self.columns_dict[i]["iso-time"] = column
+            # Create permissions CellRenderer
+            column = Gtk.TreeViewColumn(_("Permissions"))
+            column.set_resizable(True)
+            rentext = CellRendererFileMode()
+            column.pack_start(rentext, False)
+            column.set_attributes(rentext, file_mode=col_index(COL_PERMS, i))
             self.treeview[i].append_column(column)
             self.columns_dict[i]["permissions"] = column
-        self.update_treeview_columns(self.prefs.dirdiff_columns)
 
         for i in range(3):
             selection = self.treeview[i].get_selection()
-            selection.set_mode(gtk.SELECTION_MULTIPLE)
+            selection.set_mode(Gtk.SelectionMode.MULTIPLE)
             selection.connect('changed', self.on_treeview_selection_changed, i)
             self.scrolledwindow[i].get_vadjustment().connect(
                 "value-changed", self._sync_vscroll)
@@ -393,131 +665,113 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                 "value-changed", self._sync_hscroll)
         self.linediffs = [[], []]
 
+        self.update_treeview_columns(settings, 'folder-columns')
+        settings.connect('changed::folder-columns',
+                         self.update_treeview_columns)
+
+        self.update_comparator()
+        self.connect("notify::shallow-comparison", self.update_comparator)
+        self.connect("notify::time-resolution", self.update_comparator)
+        self.connect("notify::ignore-blank-lines", self.update_comparator)
+        self.connect("notify::apply-text-filters", self.update_comparator)
+
+        # The list copying and state_filters reset here is because the action
+        # toggled callback modifies the state while we're constructing it.
         self.state_filters = []
+        state_filters = []
         for s in self.state_actions:
-            if self.state_actions[s][0] in self.prefs.dir_status_filters:
-                self.state_filters.append(s)
+            if self.state_actions[s][0] in self.props.status_filters:
+                state_filters.append(s)
                 action_name = self.state_actions[s][1]
-                self.actiongroup.get_action(action_name).set_active(True)
+                self.set_action_state(
+                    action_name, GLib.Variant.new_boolean(True))
+        self.state_filters = state_filters
 
-    def on_style_set(self, widget, prev_style):
-        style = widget.get_style()
+        self._scan_in_progress = 0
 
-        lookup = lambda color_id, default: style.lookup_color(color_id) or \
-                                           gtk.gdk.color_parse(default)
-
-        self.fill_colors = {"insert"  : lookup("insert-bg", "DarkSeaGreen1"),
-                            "delete"  : lookup("delete-bg", "White"),
-                            "replace" : lookup("replace-bg", "#ddeeff"),
-                            "error"   : lookup("error-bg", "#fce94f")}
-        self.line_colors = {"insert"  : lookup("insert-outline", "#77f077"),
-                            "delete"  : lookup("delete-outline", "Grey"),
-                            "replace" : lookup("replace-outline", "#8bbff3"),
-                            "error"   : lookup("error-outline", "#edd400")}
-
-        for diffmap in self.diffmap:
-            diffmap.set_color_scheme([self.fill_colors, self.line_colors])
-        self.queue_draw()
+        self.marked = None
 
     def queue_draw(self):
         for treeview in self.treeview:
             treeview.queue_draw()
-        for diffmap in self.diffmap:
-            diffmap.queue_draw()
 
-    def on_preference_changed(self, key, value):
-        if key == "dirdiff_columns":
-            self.update_treeview_columns(value)
-        elif key == "dirdiff_shallow_comparison":
-            self.refresh()
-        elif key == "dirdiff_time_resolution_ns":
-            self.refresh()
-        elif key == "ignore_blank_lines":
-            self.refresh()
+    def update_comparator(self, *args):
+        comparison_args = {
+            'shallow-comparison': self.props.shallow_comparison,
+            'time-resolution': self.props.time_resolution,
+            'apply-text-filters': self.props.apply_text_filters,
+            'ignore_blank_lines': self.props.ignore_blank_lines,
+        }
+        self.file_compare = functools.partial(
+            _files_same, comparison_args=comparison_args)
+        self.refresh()
 
-    def update_treeview_columns(self, columns):
+    def update_treeview_columns(
+        self, settings: Gio.Settings, key: str,
+    ) -> None:
         """Update the visibility and order of columns"""
-        for i in range(3):
-            extra_cols = False
-            last_column = self.treeview[i].get_column(0)
-            for line in columns:
-                column_name, visible = line.rsplit(" ", 1)
-                visible = bool(int(visible))
-                extra_cols = extra_cols or visible
-                current_column = self.columns_dict[i][column_name]
+
+        columns = settings.get_value(key)
+        have_extra_columns = any(visible for name, visible in columns)
+
+        # Check for columns missing from the settings, special-casing
+        # the always-present name column
+        configured_columns = [name for name, visible in columns] + ["name"]
+        missing_columns = [
+            c for c in self.columns_dict[0].keys()
+            if c not in configured_columns
+        ]
+
+        for i, treeview in enumerate(self.treeview):
+            last_column = treeview.get_column(0)
+            for column_name, visible in columns:
+                try:
+                    current_column = self.columns_dict[i][column_name]
+                except KeyError:
+                    log.warning(f"Invalid column {column_name} in settings")
+                    continue
                 current_column.set_visible(visible)
-                self.treeview[i].move_column_after(current_column, last_column)
+                treeview.move_column_after(current_column, last_column)
                 last_column = current_column
-            self.treeview[i].set_headers_visible(extra_cols)
 
-    def on_custom_filter_menu_toggled(self, item):
-        if item.get_active():
-            self.custom_popup.connect("deactivate",
-                                      lambda popup: item.set_active(False))
-            self.custom_popup.popup(None, None, misc.position_menu_under_widget,
-                                    1, gtk.get_current_event_time(),
-                                    self.filter_menu_button)
+            for column_name in missing_columns:
+                self.columns_dict[i][column_name].set_visible(False)
 
-    def _cleanup_filter_menu_button(self, ui):
-        if self.popup_deactivate_id:
-            self.popup_menu.disconnect(self.popup_deactivate_id)
-        if self.custom_merge_id:
-            ui.remove_ui(self.custom_merge_id)
-        if self.filter_actiongroup in ui.get_action_groups():
-            ui.remove_action_group(self.filter_actiongroup)
+            treeview.set_headers_visible(have_extra_columns)
 
-    def _create_filter_menu_button(self, ui):
-        ui.insert_action_group(self.filter_actiongroup, -1)
-        self.custom_merge_id = ui.new_merge_id()
-        for x in self.filter_ui:
-            ui.add_ui(self.custom_merge_id, *x)
-        self.popup_deactivate_id = self.popup_menu.connect("deactivate", self.on_popup_deactivate_event)
-        self.custom_popup = ui.get_widget("/CustomPopup")
-        self.filter_menu_button = ui.get_widget("/Toolbar/FilterActions/CustomFilterMenu")
-        label = misc.make_tool_button_widget(self.filter_menu_button.props.label)
-        self.filter_menu_button.set_label_widget(label)
-
-    def on_container_switch_in_event(self, ui):
-        self.main_actiongroup = [a for a in ui.get_action_groups()
-                                 if a.get_name() == "MainActions"][0]
-        melddoc.MeldDoc.on_container_switch_in_event(self, ui)
-        self._create_filter_menu_button(ui)
-        self.ui_manager = ui
-
-    def on_container_switch_out_event(self, ui):
-        self._cleanup_filter_menu_button(ui)
-        melddoc.MeldDoc.on_container_switch_out_event(self, ui)
+    def get_filter_visibility(self) -> Tuple[bool, bool, bool]:
+        # TODO: Make text filters available in folder comparison
+        return False, True, False
 
     def on_file_filters_changed(self, app):
-        self._cleanup_filter_menu_button(self.ui_manager)
         relevant_change = self.create_name_filters()
-        self._create_filter_menu_button(self.ui_manager)
         if relevant_change:
             self.refresh()
 
     def create_name_filters(self):
+        meld_settings = get_meld_settings()
+
         # Ordering of name filters is irrelevant
-        old_active = set([f.filter_string for f in self.name_filters if f.active])
-        new_active = set([f.filter_string for f in app.file_filters if f.active])
+        old_active = set([f.filter_string for f in self.name_filters
+                          if f.active])
+        new_active = set([f.filter_string for f in meld_settings.file_filters
+                          if f.active])
         active_filters_changed = old_active != new_active
 
-        self.name_filters = [copy.copy(f) for f in app.file_filters]
-        actions = []
-        disabled_actions = []
-        self.filter_ui = []
-        for i, f in enumerate(self.name_filters):
-            name = "Hide%d" % i
-            callback = lambda b, i=i: self._update_name_filter(b, i)
-            actions.append((name, None, f.label, None, _("Hide %s") % f.label, callback, f.active))
-            self.filter_ui.append(["/CustomPopup" , name, name, gtk.UI_MANAGER_MENUITEM, False])
-            self.filter_ui.append(["/Menubar/ViewMenu/FileFilters" , name, name, gtk.UI_MANAGER_MENUITEM, False])
-            if f.filter is None:
-                disabled_actions.append(name)
-
-        self.filter_actiongroup = gtk.ActionGroup("DirdiffFilterActions")
-        self.filter_actiongroup.add_toggle_actions(actions)
-        for name in disabled_actions:
-            self.filter_actiongroup.get_action(name).set_sensitive(False)
+        # TODO: Rework name_filters to use a map-like structure so that we
+        # don't need _action_name_filter_map.
+        self._action_name_filter_map = {}
+        self.name_filters = [copy.copy(f) for f in meld_settings.file_filters]
+        for i, filt in enumerate(self.name_filters):
+            action = Gio.SimpleAction.new_stateful(
+                name=FILE_FILTER_ACTION_FORMAT.format(i),
+                parameter_type=None,
+                state=GLib.Variant.new_boolean(filt.active),
+            )
+            action.connect('change-state', self._update_name_filter)
+            action.set_enabled(filt.filter is not None)
+            self.view_action_group.add_action(action)
+            self._action_name_filter_map[action] = filt
 
         return active_filters_changed
 
@@ -527,12 +781,15 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             self.refresh()
 
     def create_text_filters(self):
+        meld_settings = get_meld_settings()
+
         # In contrast to file filters, ordering of text filters can matter
         old_active = [f.filter_string for f in self.text_filters if f.active]
-        new_active = [f.filter_string for f in app.text_filters if f.active]
+        new_active = [f.filter_string for f in meld_settings.text_filters
+                      if f.active]
         active_filters_changed = old_active != new_active
 
-        self.text_filters = [copy.copy(f) for f in app.text_filters]
+        self.text_filters = [copy.copy(f) for f in meld_settings.text_filters]
 
         return active_filters_changed
 
@@ -551,11 +808,13 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
 
     def _sync_vscroll(self, adjustment):
         adjs = [sw.get_vadjustment() for sw in self.scrolledwindow]
-        self._do_to_others(adjustment, adjs, "set_value", (adjustment.value, ))
+        self._do_to_others(
+            adjustment, adjs, "set_value", (int(adjustment.get_value()),))
 
     def _sync_hscroll(self, adjustment):
         adjs = [sw.get_hadjustment() for sw in self.scrolledwindow]
-        self._do_to_others(adjustment, adjs, "set_value", (adjustment.value, ))
+        self._do_to_others(
+            adjustment, adjs, "set_value", (int(adjustment.get_value()),))
 
     def _get_focused_pane(self):
         for i, treeview in enumerate(self.treeview):
@@ -567,66 +826,105 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         # is file still extant in other pane?
         it = self.model.get_iter(path)
         files = self.model.value_paths(it)
-        is_present = [ os.path.exists(f) for f in files ]
+        is_present = [os.path.exists(f) for f in files]
         if 1 in is_present:
             self._update_item_state(it)
-        else: # nope its gone
+        else:  # nope its gone
             self.model.remove(it)
-        self._update_diffmaps()
 
     def file_created(self, path, pane):
         it = self.model.get_iter(path)
-        while it and self.model.get_path(it) != (0,):
-            self._update_item_state( it )
+        root = Gtk.TreePath.new_first()
+        while it and self.model.get_path(it) != root:
+            self._update_item_state(it)
             it = self.model.iter_parent(it)
-        self._update_diffmaps()
 
-    def on_fileentry_activate(self, entry):
-        locs = [e.get_full_path() for e in self.fileentry[:self.num_panes]]
-        locs = [l.decode('utf8') for l in locs]
-        self.set_locations(locs)
+    @Gtk.Template.Callback()
+    def on_file_selected(
+            self, button: Gtk.Button, pane: int, file: Gio.File) -> None:
+        self.folders[pane] = file
+        self.set_locations()
 
-    def set_locations(self, locations):
+    def set_locations(self) -> None:
+        locations = [f.get_path() for f in self.folders if f]
+        if not locations:
+            return
+
         self.set_num_panes(len(locations))
+
+        parent_path = find_shared_parent_path(self.folders)
+        for pane, folder in enumerate(self.folders):
+            self.folder_label[pane].set_file(folder)
+            self.folder_label[pane].set_parent_file(parent_path)
+            self.folder_open_button[pane].props.file = folder
+
         # This is difficult to trigger, and to test. Most of the time here we
         # will actually have had UTF-8 from GTK, which has been unicode-ed by
         # the time we get this far. This is a fallback, and may be wrong!
         locations = list(locations)
         for i, l in enumerate(locations):
-            if not isinstance(l, unicode):
+            if l and not isinstance(l, str):
                 locations[i] = l.decode(sys.getfilesystemencoding())
-        # TODO: Support for blank folder comparisons should probably look here
-        locations = [os.path.abspath(l or ".") for l in locations]
+        locations = [os.path.abspath(l) if l else '' for l in locations]
+
         self.current_path = None
+        self.marked = None
         self.model.clear()
-        for pane, loc in enumerate(locations):
-            self.fileentry[pane].set_filename(loc)
-            self.fileentry[pane].prepend_history(loc)
+        for m in self.msgarea_mgr:
+            m.clear()
         child = self.model.add_entries(None, locations)
         self.treeview0.grab_focus()
         self._update_item_state(child)
         self.recompute_label()
         self.scheduler.remove_all_tasks()
-        self.recursively_update( (0,) )
-        self._update_diffmaps()
+        self._scan_in_progress = 0
+        self.recursively_update(Gtk.TreePath.new_first())
 
     def get_comparison(self):
-        root = self.model.get_iter_root()
+        root = self.model.get_iter_first()
         if root:
-            folders = self.model.value_paths(root)
+            uris = [Gio.File.new_for_path(d)
+                    for d in self.model.value_paths(root)]
         else:
-            folders = []
-        return recent.TYPE_FOLDER, folders
+            uris = []
+        return RecentType.Folder, uris
 
-    def recursively_update( self, path ):
+    def mark_in_progress_row(self, it: Gtk.TreeIter) -> None:
+        """Mark a tree row as having a scan in progress
+
+        After the scan is finished, `_update_item_state()` must be
+        called on the row to restore its actual state.
+        """
+
+        for pane in range(self.model.ntree):
+            path = self.model.get_value(
+                it, self.model.column_index(tree.COL_PATH, pane))
+            filename = GLib.markup_escape_text(os.path.basename(path))
+            label = _(f"{filename} (scanning…)")
+
+            self.model.set_state(it, pane, tree.STATE_SPINNER, label, True)
+            self.model.unsafe_set(it, pane, {
+                COL_EMBLEM: None,
+                COL_EMBLEM_SECONDARY: None,
+                COL_TIME: MISSING_TIMESTAMP,
+                COL_SIZE: -1,
+                COL_PERMS: -1
+            })
+
+    def recursively_update(self, path):
         """Recursively update from tree path 'path'.
         """
-        it = self.model.get_iter( path )
-        child = self.model.iter_children( it )
+        it = self.model.get_iter(path)
+        child = self.model.iter_children(it)
         while child:
             self.model.remove(child)
-            child = self.model.iter_children( it )
-        self._update_item_state(it)
+            child = self.model.iter_children(it)
+        if self._scan_in_progress == 0:
+            # Starting a scan, so set up progress indicator
+            self.mark_in_progress_row(it)
+        else:
+            self._update_item_state(it)
+        self._scan_in_progress += 1
         self.scheduler.add_task(self._search_recursively_iter(path))
 
     def _search_recursively_iter(self, rootpath):
@@ -634,34 +932,45 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             sel = t.get_selection()
             sel.unselect_all()
 
-        yield _("[%s] Scanning %s") % (self.label_text, "")
-        prefixlen = 1 + len( self.model.value_path( self.model.get_iter(rootpath), 0 ) )
+        yield _('[{label}] Scanning {folder}').format(
+            label=self.label_text, folder='')
+        prefixlen = 1 + len(
+            self.model.value_path(self.model.get_iter(rootpath), 0))
         symlinks_followed = set()
-        todo = [ rootpath ]
+        # TODO: This is horrible.
+        if isinstance(rootpath, tuple):
+            rootpath = Gtk.TreePath(rootpath)
+        todo = [rootpath]
         expanded = set()
 
         shadowed_entries = []
         invalid_filenames = []
+
+        # TODO: Map these action states to GObject props instead?
+        comparison_options = ComparisonOptions(
+            ignore_case=self.get_action_state('folder-ignore-case'),
+            normalize_encoding=self.get_action_state(
+                'folder-normalize-encoding'),
+        )
+
         while len(todo):
-            todo.sort() # depth first
+            todo.sort()  # depth first
             path = todo.pop(0)
-            it = self.model.get_iter( path )
-            roots = self.model.value_paths( it )
+            it = self.model.get_iter(path)
+            roots = self.model.value_paths(it)
 
             # Buggy ordering when deleting rows means that we sometimes try to
             # recursively update files; this fix seems the least invasive.
             if not any(os.path.isdir(root) for root in roots):
                 continue
 
-            yield _("[%s] Scanning %s") % (self.label_text, roots[0][prefixlen:])
+            yield _('[{label}] Scanning {folder}').format(
+                label=self.label_text, folder=roots[0][prefixlen:])
             differences = False
             encoding_errors = []
 
-            canonicalize = None
-            if self.actiongroup.get_action("IgnoreCase").get_active():
-                canonicalize = lambda x : x.lower()
-            dirs = CanonicalListing(self.num_panes, canonicalize)
-            files = CanonicalListing(self.num_panes, canonicalize)
+            dirs = CanonicalListing(self.num_panes, comparison_options)
+            files = CanonicalListing(self.num_panes, comparison_options)
 
             for pane, root in enumerate(roots):
                 if not os.path.isdir(root):
@@ -681,11 +990,11 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
 
                 for e in entries:
                     try:
-                        if not isinstance(e, unicode):
-                            e = e.decode('utf8')
-                    except UnicodeDecodeError:
-                        approximate_name = e.decode('utf8', 'replace')
-                        encoding_errors.append((pane, approximate_name))
+                        e.encode('utf8')
+                    except UnicodeEncodeError:
+                        invalid = e.encode('utf8', 'surrogatepass')
+                        printable = invalid.decode('utf8', 'backslashreplace')
+                        encoding_errors.append((pane, printable))
                         continue
 
                     try:
@@ -697,7 +1006,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                         continue
 
                     if stat.S_ISLNK(s.st_mode):
-                        if self.prefs.ignore_symlinks:
+                        if self.props.ignore_symlinks:
                             continue
                         key = (s.st_dev, s.st_ino)
                         if key in symlinks_followed:
@@ -730,33 +1039,120 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             for pane, f1, f2 in dirs.errors + files.errors:
                 shadowed_entries.append((pane, roots[pane], f1, f2))
 
-            alldirs = dirs.get()
+            alldirs = self._filter_on_state(roots, dirs.get())
             allfiles = self._filter_on_state(roots, files.get())
 
-            # then directories and files
-            if len(alldirs) + len(allfiles) != 0:
+            if alldirs or allfiles:
                 for names in alldirs:
-                    entries = [os.path.join(r, n) for r, n in zip(roots, names)]
+                    entries = [
+                        os.path.join(r, n) for r, n in zip(roots, names)]
                     child = self.model.add_entries(it, entries)
                     differences |= self._update_item_state(child)
                     todo.append(self.model.get_path(child))
                 for names in allfiles:
-                    entries = [os.path.join(r, n) for r, n in zip(roots, names)]
+                    entries = [
+                        os.path.join(r, n) for r, n in zip(roots, names)]
                     child = self.model.add_entries(it, entries)
                     differences |= self._update_item_state(child)
-            else: # directory is empty, add a placeholder
-                self.model.add_empty(it)
+            else:
+                # Our subtree is empty, or has been filtered to be empty
+                if (tree.STATE_NORMAL in self.state_filters or
+                        not all(os.path.isdir(f) for f in roots)):
+                    self.model.add_empty(it)
+                    if self.model.iter_parent(it) is None:
+                        expanded.add(tree_path_as_tuple(rootpath))
+                else:
+                    # At this point, we have an empty folder tree node; we can
+                    # prune this and any ancestors that then end up empty.
+                    while not self.model.iter_has_child(it):
+                        parent = self.model.iter_parent(it)
+
+                        # In our tree, there is always a top-level parent with
+                        # no siblings. If we're here, we have an empty tree.
+                        if parent is None:
+                            self.model.add_empty(it)
+                            break
+
+                        # Remove the current row, and then revalidate all
+                        # sibling paths on the stack by removing and
+                        # readding them.
+                        had_siblings = self.model.remove(it)
+                        if had_siblings:
+                            parent_path = self.model.get_path(parent)
+                            for path in todo:
+                                if parent_path.is_ancestor(path):
+                                    path.prev()
+
+                        it = parent
+
             if differences:
-                expanded.add(path)
+                expanded.add(tree_path_as_tuple(path))
 
-        self._show_tree_wide_errors(invalid_filenames, shadowed_entries)
+        duplicate_dirs = list(set(p for p in roots if roots.count(p) > 1))
+        if invalid_filenames or shadowed_entries:
+            self._show_tree_wide_errors(invalid_filenames, shadowed_entries)
+        elif duplicate_dirs:
+            # Since we can only load 3 dirs we can have at most 1 duplicate
+            self._show_duplicate_directory(duplicate_dirs[0])
+        elif rootpath == Gtk.TreePath.new_first() and not expanded:
+            self._show_identical_status()
 
+        self.treeview[0].expand_to_path(Gtk.TreePath(("0",)))
         for path in sorted(expanded):
-            self.treeview[0].expand_to_path(path)
-        yield _("[%s] Done") % self.label_text
+            self.treeview[0].expand_to_path(Gtk.TreePath(path))
+        yield _('[{label}] Done').format(label=self.label_text)
 
-        self.scheduler.add_task(self.on_treeview_cursor_changed)
-        self.treeview[0].get_selection().select_path((0,))
+        self._scan_in_progress -= 1
+        if self._scan_in_progress == 0:
+            # Finishing a scan, so remove progress indicator
+            self._update_item_state(self.model.get_iter(rootpath))
+
+        self.force_cursor_recalculate = True
+        self.treeview[0].set_cursor(Gtk.TreePath.new_first())
+
+    def _show_duplicate_directory(self, duplicate_directory):
+        for index in range(self.num_panes):
+            primary = _(
+                'Folder {} is being compared to itself').format(
+                duplicate_directory)
+            self.msgarea_mgr[index].add_dismissable_msg(
+                'dialog-warning-symbolic', primary, '', self.msgarea_mgr)
+
+    def _show_identical_status(self):
+        primary = _("Folders have no differences")
+        identical_note = _(
+            "Contents of scanned files in folders are identical.")
+        shallow_note = _(
+            "Scanned files in folders appear identical, but contents have not "
+            "been scanned.")
+        file_filter_qualifier = _(
+            "File filters are in use, so not all files have been scanned.")
+        text_filter_qualifier = _(
+            "Text filters are in use and may be masking content differences.")
+
+        is_shallow = self.props.shallow_comparison
+        have_file_filters = any(f.active for f in self.name_filters)
+        have_text_filters = any(f.active for f in self.text_filters)
+
+        secondary = [shallow_note if is_shallow else identical_note]
+        if have_file_filters:
+            secondary.append(file_filter_qualifier)
+        if not is_shallow and have_text_filters:
+            secondary.append(text_filter_qualifier)
+        secondary = " ".join(secondary)
+
+        for pane in range(self.num_panes):
+            msgarea = self.msgarea_mgr[pane].new_from_text_and_icon(
+                'dialog-information-symbolic', primary, secondary)
+            button = msgarea.add_button(_("Hide"), Gtk.ResponseType.CLOSE)
+            if pane == 0:
+                button.props.label = _("Hi_de")
+
+            def clear_all(*args):
+                for p in range(self.num_panes):
+                    self.msgarea_mgr[p].clear()
+            msgarea.connect("response", clear_all)
+            msgarea.show_all()
 
     def _show_tree_wide_errors(self, invalid_filenames, shadowed_entries):
         header = _("Multiple errors occurred while scanning this folder")
@@ -777,7 +1173,10 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         formatted_entries = [[] for i in range(self.num_panes)]
         for pane, root, f1, f2 in shadowed_entries:
             paths = [os.path.join(root, f) for f in (f1, f2)]
-            entry_str = _("'%s' hidden by '%s'") % (paths[0], paths[1])
+            entry_str = _("“{first_file}” hidden by “{second_file}”").format(
+                first_file=paths[0],
+                second_file=paths[1],
+            )
             formatted_entries[pane].append(entry_str)
 
         if invalid_filenames or shadowed_entries:
@@ -796,132 +1195,116 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                 else:
                     continue
                 secondary = "\n".join(messages)
-                self.add_dismissable_msg(pane, gtk.STOCK_DIALOG_ERROR, header,
-                                         secondary)
-
-    def add_dismissable_msg(self, pane, icon, primary, secondary):
-        msgarea = self.msgarea_mgr[pane].new_from_text_and_icon(
-                        icon, primary, secondary)
-        button = msgarea.add_stock_button_with_text(_("Hi_de"),
-                        gtk.STOCK_CLOSE, gtk.RESPONSE_CLOSE)
-        msgarea.connect("response",
-                        lambda *args: self.msgarea_mgr[pane].clear())
-        msgarea.show_all()
-        return msgarea
+                self.msgarea_mgr[pane].add_dismissable_msg(
+                    'dialog-error-symbolic', header, secondary)
 
     def copy_selected(self, direction):
-        assert direction in (-1,1)
+        assert direction in (-1, 1)
         src_pane = self._get_focused_pane()
-        if src_pane is not None:
-            dst_pane = src_pane + direction
-            assert dst_pane >= 0 and dst_pane < self.num_panes
-            paths = self._get_selected_paths(src_pane)
-            paths.reverse()
-            model = self.model
-            for path in paths: #filter(lambda x: x.name is not None, sel):
-                it = model.get_iter(path)
-                name = model.value_path(it, src_pane)
-                if name is None:
-                    continue
-                src = model.value_path(it, src_pane)
-                dst = model.value_path(it, dst_pane)
-                try:
-                    if os.path.isfile(src):
-                        dstdir = os.path.dirname( dst )
-                        if not os.path.exists( dstdir ):
-                            os.makedirs( dstdir )
-                        misc.copy2( src, dstdir )
-                        self.file_created( path, dst_pane)
-                    elif os.path.isdir(src):
-                        if os.path.exists(dst):
-                            if misc.run_dialog( _("'%s' exists.\nOverwrite?") % os.path.basename(dst),
-                                    parent = self,
-                                    buttonstype = gtk.BUTTONS_OK_CANCEL) != gtk.RESPONSE_OK:
-                                continue
-                        misc.copytree(src, dst)
-                        self.recursively_update( path )
-                except (OSError, IOError) as e:
-                    misc.run_dialog(_("Error copying '%s' to '%s'\n\n%s.") % (src, dst,e), self)
+        if src_pane is None:
+            return
 
-    def delete_selected(self):
-        """Delete all selected files/folders recursively.
-        """
-        # reverse so paths dont get changed
-        pane = self._get_focused_pane()
-        if pane is not None:
-            paths = self._get_selected_paths(pane)
-            paths.reverse()
-            for path in paths:
-                it = self.model.get_iter(path)
-                name = self.model.value_path(it, pane)
-                try:
-                    if os.path.isfile(name):
-                        os.remove(name)
-                        self.file_deleted( path, pane)
-                    elif os.path.isdir(name):
-                        if misc.run_dialog(_("'%s' is a directory.\nRemove recursively?") % os.path.basename(name),
-                                parent = self,
-                                buttonstype=gtk.BUTTONS_OK_CANCEL) == gtk.RESPONSE_OK:
-                            shutil.rmtree(name)
-                            self.recursively_update(path)
-                            self.file_deleted(path, pane)
-                except OSError as e:
-                    misc.run_dialog(_("Error removing %s\n\n%s.") % (name,e), parent = self)
+        dst_pane = src_pane + direction
+        assert dst_pane >= 0 and dst_pane < self.num_panes
+        paths = self._get_selected_paths(src_pane)
+        paths.reverse()
+        model = self.model
+        for path in paths:  # filter(lambda x: x.name is not None, sel):
+            it = model.get_iter(path)
+            name = model.value_path(it, src_pane)
+            if name is None:
+                continue
+            src = model.value_path(it, src_pane)
+            dst = model.value_path(it, dst_pane)
+            try:
+                if os.path.isfile(src):
+                    dstdir = os.path.dirname(dst)
+                    if not os.path.exists(dstdir):
+                        os.makedirs(dstdir)
+                    misc.copy2(src, dstdir)
+                    self.file_created(path, dst_pane)
+                elif os.path.isdir(src):
+                    if os.path.exists(dst):
+                        parent_name = os.path.dirname(dst)
+                        folder_name = os.path.basename(dst)
+                        dialog_buttons = [
+                            (_("_Cancel"), Gtk.ResponseType.CANCEL, None),
+                            (
+                                _("_Replace"), Gtk.ResponseType.OK,
+                                Gtk.STYLE_CLASS_DESTRUCTIVE_ACTION,
+                            ),
+                        ]
+                        replace = misc.modal_dialog(
+                            primary=_("Replace folder “%s”?") % folder_name,
+                            secondary=_(
+                                "Another folder with the same name already "
+                                "exists in “%s”.\n"
+                                "If you replace the existing folder, all "
+                                "files in it will be lost.") % parent_name,
+                            buttons=dialog_buttons,
+                            messagetype=Gtk.MessageType.WARNING,
+                        )
+                        if replace != Gtk.ResponseType.OK:
+                            continue
+                    misc.copytree(src, dst)
+                    self.recursively_update(path)
+            except (OSError, IOError, shutil.Error) as err:
+                misc.error_dialog(
+                    _("Error copying file"),
+                    _("Couldn’t copy {source}\nto {dest}.\n\n{error}").format(
+                        source=GLib.markup_escape_text(src),
+                        dest=GLib.markup_escape_text(dst),
+                        error=GLib.markup_escape_text(str(err)),
+                    )
+                )
+
+    @with_focused_pane
+    def delete_selected(self, pane):
+        """Trash or delete all selected files/folders recursively"""
+
+        paths = self._get_selected_paths(pane)
+
+        # Reversing paths means that we remove tree rows bottom-up, so
+        # tree paths don't change during the iteration.
+        paths.reverse()
+        for path in paths:
+            it = self.model.get_iter(path)
+            name = self.model.value_path(it, pane)
+            gfile = Gio.File.new_for_path(name)
+
+            try:
+                deleted = trash_or_confirm(gfile)
+            except Exception as e:
+                misc.error_dialog(
+                    _("Error deleting {}").format(
+                        GLib.markup_escape_text(gfile.get_parse_name()),
+                    ),
+                    str(e),
+                )
+            else:
+                if deleted:
+                    self.file_deleted(path, pane)
 
     def on_treemodel_row_deleted(self, model, path):
-
-        # TODO: Move this and path tools to new tree helper module
-        def refocus_deleted_path(model, path):
-            # Since the passed path has been deleted, either the path is now a
-            # valid successor, or there are no successors. If valid, return it.
-            # If not, and the path has a predecessor sibling (immediate or
-            # otherwise), then return that. If there are no siblings, traverse
-            # parents until we get a valid path, and return that.
-
-            def tree_path_prev(path):
-                if not path or path[-1] == 0:
-                    return None
-                return path[:-1] + (path[-1] - 1,)
-
-            def tree_path_up(path):
-                if not path:
-                    return None
-                return path[:-1]
-
-            def valid_path(model, path):
-                try:
-                    model.get_iter(path)
-                    return True
-                except ValueError:
-                    return False
-
-            if valid_path(model, path):
-                return path
-
-            new_path = tree_path_prev(path)
-            while new_path:
-                if valid_path(model, new_path):
-                    return new_path
-                new_path = tree_path_prev(new_path)
-
-            new_path = tree_path_up(path)
-            while new_path:
-                if valid_path(model, new_path):
-                    return new_path
-                new_path = tree_path_up(new_path)
-
-            return None
-
         if self.current_path == path:
             self.current_path = refocus_deleted_path(model, path)
             if self.current_path and self.focus_pane:
                 self.focus_pane.set_cursor(self.current_path)
 
+        self.row_expansions = set()
+
     def on_treeview_selection_changed(self, selection, pane):
         if not self.treeview[pane].is_focus():
             return
-        have_selection = bool(selection.count_selected_rows())
-        get_action = self.actiongroup.get_action
+        self.update_action_sensitivity()
+
+    def update_action_sensitivity(self):
+        pane = self._get_focused_pane()
+        if pane is not None:
+            selection = self.treeview[pane].get_selection()
+            have_selection = bool(selection.count_selected_rows())
+        else:
+            have_selection = False
 
         if have_selection:
             is_valid = True
@@ -931,37 +1314,68 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                     is_valid = False
                     break
 
-            get_action("DirCompare").set_sensitive(True)
-            get_action("Hide").set_sensitive(True)
-            get_action("DirDelete").set_sensitive(is_valid)
-            get_action("DirCopyLeft").set_sensitive(is_valid and pane > 0)
-            get_action("DirCopyRight").set_sensitive(
-                is_valid and pane + 1 < self.num_panes)
-            if self.main_actiongroup:
-                act = self.main_actiongroup.get_action("OpenExternal")
-                act.set_sensitive(is_valid)
-        else:
-            for action in ("DirCompare", "DirCopyLeft", "DirCopyRight",
-                           "DirDelete", "Hide"):
-                get_action(action).set_sensitive(False)
-            if self.main_actiongroup:
-                act = self.main_actiongroup.get_action("OpenExternal")
-                act.set_sensitive(False)
+            busy = self._scan_in_progress > 0
+            is_valid = is_valid and not busy
 
-    def on_treeview_cursor_changed(self, *args):
-        pane = self._get_focused_pane()
-        if pane is None:
+            is_single_foldable_row = False
+            if (selection.count_selected_rows() == 1):
+                path = selection.get_selected_rows()[1][0]
+                it = self.model.get_iter(path)
+                is_single_foldable_row = self.model.iter_has_child(it)
+
+            self.set_action_enabled('folder-collapse', is_single_foldable_row)
+            self.set_action_enabled('folder-expand', is_single_foldable_row)
+            self.set_action_enabled('folder-compare', True)
+            self.set_action_enabled('folder-mark', True)
+            self.set_action_enabled(
+                'folder-compare-marked',
+                self.marked is not None and self.marked.pane != pane)
+            self.set_action_enabled('swap-2-panes', self.num_panes == 2)
+            self.set_action_enabled('folder-delete', is_valid)
+            self.set_action_enabled('folder-copy-left', is_valid and pane > 0)
+            self.set_action_enabled(
+                'folder-copy-left-next', is_valid and pane > 0)
+            self.set_action_enabled(
+                'folder-copy-right', is_valid and pane + 1 < self.num_panes)
+            self.set_action_enabled(
+                'folder-copy-right-next',
+                is_valid and pane + 1 < self.num_panes)
+            self.set_action_enabled('open-external', is_valid)
+        else:
+            actions = (
+                'folder-collapse',
+                'folder-compare',
+                'folder-mark',
+                'folder-compare-marked',
+                'folder-copy-left',
+                'folder-copy-left-next',
+                'folder-copy-right',
+                'folder-copy-right-next',
+                'folder-delete',
+                'folder-expand',
+                'open-external',
+            )
+            for action in actions:
+                self.set_action_enabled(action, False)
+
+    @Gtk.Template.Callback()
+    def on_treeview_cursor_changed(self, view):
+        pane = self.treeview.index(view)
+        if len(self.model) == 0:
             return
 
         cursor_path, cursor_col = self.treeview[pane].get_cursor()
         if not cursor_path:
-            self.emit("next-diff-changed", False, False)
+            self.set_action_enabled("previous-change", False)
+            self.set_action_enabled("next-change", False)
             self.current_path = cursor_path
             return
 
-        # If invoked directly rather than through a callback, we always check
-        if not args:
+        if self.force_cursor_recalculate:
+            # We force cursor recalculation on initial load, and when
+            # we handle model change events.
             skip = False
+            self.force_cursor_recalculate = False
         else:
             try:
                 old_cursor = self.model.get_iter(self.current_path)
@@ -972,7 +1386,9 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                 # We can skip recalculation if the new cursor is between
                 # the previous/next bounds, and we weren't on a changed row
                 state = self.model.get_state(old_cursor, 0)
-                if state not in (tree.STATE_NORMAL, tree.STATE_EMPTY):
+                if state not in (
+                        tree.STATE_NORMAL, tree.STATE_NOCHANGE,
+                        tree.STATE_EMPTY):
                     skip = False
                 else:
                     if self.prev_path is None and self.next_path is None:
@@ -985,63 +1401,60 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                         skip = self.prev_path < cursor_path < self.next_path
 
         if not skip:
-            prev, next = self.model._find_next_prev_diff(cursor_path)
-            self.prev_path, self.next_path = prev, next
-            have_next_diffs = (prev is not None, next is not None)
-            self.emit("next-diff-changed", *have_next_diffs)
+            prev, next_ = self.model._find_next_prev_diff(cursor_path)
+            self.prev_path, self.next_path = prev, next_
+            self.set_action_enabled("previous-change", prev is not None)
+            self.set_action_enabled("next-change", next_ is not None)
+
         self.current_path = cursor_path
 
-        paths = self._get_selected_paths(pane)
-        if len(paths) > 0:
-            def rwx(mode):
-                return "".join( [ ((mode& (1<<i)) and "xwr"[i%3] or "-") for i in range(8,-1,-1) ] )
-            def nice(deltat):
-                times = (
-                    (60, lambda n: ngettext("%i second","%i seconds",n)),
-                    (60, lambda n: ngettext("%i minute","%i minutes",n)),
-                    (24, lambda n: ngettext("%i hour","%i hours",n)),
-                    ( 7, lambda n: ngettext("%i day","%i days",n)),
-                    ( 4, lambda n: ngettext("%i week","%i weeks",n)),
-                    (12, lambda n: ngettext("%i month","%i months",n)),
-                    (100,lambda n: ngettext("%i year","%i years",n)) )
-                for units, msg in times:
-                    if abs(int(deltat)) < 5 * units:
-                        return msg(int(deltat)) % int(deltat)
-                    deltat /= units
-            fname = self.model.value_path( self.model.get_iter(paths[0]), pane )
-            try:
-                stat = os.stat(fname)
-            # TypeError for if fname is None
-            except (OSError, TypeError):
-                self.status_info_labels[0].set_text("")
-                self.status_info_labels[1].set_markup("")
-            else:
-                mode_text = "<tt>%s</tt>" % rwx(stat.st_mode)
-                last_changed_text = str(nice(time.time() - stat.st_mtime))
-                self.status_info_labels[0].set_text(last_changed_text)
-                self.status_info_labels[1].set_markup(mode_text)
+    @Gtk.Template.Callback()
+    def on_treeview_popup_menu(self, treeview):
+        return tree.TreeviewCommon.on_treeview_popup_menu(self, treeview)
 
+    @Gtk.Template.Callback()
+    def on_treeview_button_press_event(self, treeview, event):
+        return tree.TreeviewCommon.on_treeview_button_press_event(
+            self, treeview, event)
+
+    @with_focused_pane
+    def action_prev_pane(self, pane, *args):
+        new_pane = (pane - 1) % self.num_panes
+        self.change_focused_tree(self.treeview[pane], self.treeview[new_pane])
+
+    @with_focused_pane
+    def action_next_pane(self, pane, *args):
+        new_pane = (pane + 1) % self.num_panes
+        self.change_focused_tree(self.treeview[pane], self.treeview[new_pane])
+
+    @Gtk.Template.Callback()
     def on_treeview_key_press_event(self, view, event):
-        pane = self.treeview.index(view)
-        tree = None
-        if gtk.keysyms.Right == event.keyval:
-            if pane+1 < self.num_panes:
-                tree = self.treeview[pane+1]
-        elif gtk.keysyms.Left == event.keyval:
-            if pane-1 >= 0:
-                tree = self.treeview[pane-1]
-        if tree is not None:
-            paths = self._get_selected_paths(pane)
-            view.get_selection().unselect_all()
-            tree.grab_focus()
-            tree.get_selection().unselect_all()
-            if len(paths):
-                tree.set_cursor(paths[0])
-                for p in paths:
-                    tree.get_selection().select_path(p)
-            tree.emit("cursor-changed")
-        return event.keyval in (gtk.keysyms.Left, gtk.keysyms.Right) #handled
+        if event.keyval not in (Gdk.KEY_Left, Gdk.KEY_Right):
+            return False
 
+        pane = self.treeview.index(view)
+        target_pane = pane + 1 if event.keyval == Gdk.KEY_Right else pane - 1
+        if 0 <= target_pane < self.num_panes:
+            self.change_focused_tree(view, self.treeview[target_pane])
+
+        return True
+
+    def change_focused_tree(
+            self, old_view: Gtk.TreeView, new_view: Gtk.TreeView):
+
+        paths = old_view.get_selection().get_selected_rows()[1]
+        old_view.get_selection().unselect_all()
+
+        new_view.grab_focus()
+        new_view.get_selection().unselect_all()
+        if paths:
+            new_view.set_cursor(paths[0])
+            for p in paths:
+                new_view.get_selection().select_path(p)
+
+        new_view.emit("cursor-changed")
+
+    @Gtk.Template.Callback()
     def on_treeview_row_activated(self, view, path, column):
         pane = self.treeview.index(view)
         rows = self.model.value_paths(self.model.get_iter(path))
@@ -1055,98 +1468,196 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         if not rows[pane]:
             return
         if os.path.isfile(rows[pane]):
-            self.emit("create-diff", [r for r in rows if os.path.isfile(r)],
-                      {})
+            diff_gfiles = [
+                Gio.File.new_for_path(r) if os.path.isfile(r) else None
+                for r in rows
+            ]
+            self.create_diff_signal.emit(diff_gfiles, {})
         elif os.path.isdir(rows[pane]):
             if view.row_expanded(path):
                 view.collapse_row(path)
             else:
                 view.expand_row(path, False)
 
+    @Gtk.Template.Callback()
     def on_treeview_row_expanded(self, view, it, path):
-        self._do_to_others(view, self.treeview, "expand_row", (path,0) )
-        self._update_diffmaps()
+        self.row_expansions.add(str(path))
+        for row in self.model[path].iterchildren():
+            if str(row.path) in self.row_expansions:
+                view.expand_row(row.path, False)
 
+        self._do_to_others(view, self.treeview, "expand_row", (path, False))
+
+    @Gtk.Template.Callback()
     def on_treeview_row_collapsed(self, view, me, path):
-        self._do_to_others(view, self.treeview, "collapse_row", (path,) )
-        self._update_diffmaps()
+        self.row_expansions.discard(str(path))
+        self._do_to_others(view, self.treeview, "collapse_row", (path,))
 
-    def on_popup_deactivate_event(self, popup):
-        for (treeview, inid, outid) in zip(self.treeview, self.focus_in_events, self.focus_out_events):
-            treeview.handler_unblock(inid)
-            treeview.handler_unblock(outid)
-
+    @Gtk.Template.Callback()
     def on_treeview_focus_in_event(self, tree, event):
         self.focus_pane = tree
-        pane = self.treeview.index(tree)
-        self.on_treeview_selection_changed(tree.get_selection(), pane)
+        self.update_action_sensitivity()
         tree.emit("cursor-changed")
 
-    def on_treeview_focus_out_event(self, tree, event):
-        for action in ("DirCompare", "DirCopyLeft", "DirCopyRight",
-                       "DirDelete", "Hide"):
-            self.actiongroup.get_action(action).set_sensitive(False)
-        try:
-            self.main_actiongroup.get_action("OpenExternal").set_sensitive(
-                False)
-        except AttributeError:
-            pass
+    def run_diff_from_iter(self, it):
+        row_paths = self.model.value_paths(it)
+        gfiles = [Gio.File.new_for_path(p)
+                  for p in row_paths if os.path.exists(p)]
+        self.create_diff_signal.emit(gfiles, {})
 
-    def on_button_diff_clicked(self, button):
+    def action_diff(self, *args):
         pane = self._get_focused_pane()
         if pane is None:
             return
 
         selected = self._get_selected_paths(pane)
         for row in selected:
-            row_paths = self.model.value_paths(self.model.get_iter(row))
-            paths = [p for p in row_paths if os.path.exists(p)]
-            self.emit("create-diff", paths, {})
+            self.run_diff_from_iter(self.model.get_iter(row))
 
-    def on_button_copy_left_clicked(self, button):
-        self.copy_selected(-1)
-    def on_button_copy_right_clicked(self, button):
-        self.copy_selected(1)
-    def on_button_delete_clicked(self, button):
-        self.delete_selected()
-
-    def open_external(self):
+    def action_mark(self, *args):
         pane = self._get_focused_pane()
         if pane is None:
             return
-        path = lambda p: self.model.value_path(self.model.get_iter(p), pane)
-        files = [path(p) for p in self._get_selected_paths(pane)]
-        files = [f for f in files if f]
-        if files:
-            self._open_files(files)
 
-    def on_button_ignore_case_toggled(self, button):
+        selected = self._get_selected_paths(pane)
+        if selected is None:
+            return
+
+        old_mark_it = self.marked.get_iter() if self.marked else None
+        self.marked = ComparisonMarker.from_selection(
+            self.treeview[pane], pane)
+
+        self._update_item_state(self.marked.get_iter())
+        if old_mark_it:
+            self._update_item_state(old_mark_it)
+
+    def action_diff_marked(self, *args):
+        pane = self._get_focused_pane()
+        if pane is None:
+            return
+
+        selected = self.model.get_iter(self._get_selected_paths(pane)[0])
+        if selected is None:
+            return
+
+        mark_it = self.marked.get_iter()
+        marked_path = self.model.value_paths(mark_it)[self.marked.pane]
+        selected_path = self.model.value_paths(selected)[pane]
+
+        # Maintain the pane ordering in the new comparison, regardless
+        # of which pane is the marked one.
+        if pane < self.marked.pane:
+            row_paths = [selected_path, marked_path]
+        else:
+            row_paths = [marked_path, selected_path]
+
+        gfiles = [Gio.File.new_for_path(p)
+                  for p in row_paths if os.path.exists(p)]
+        self.create_diff_signal.emit(gfiles, {})
+
+    def action_folder_collapse(self, *args):
+        pane = self._get_focused_pane()
+        if pane is None:
+            return
+
+        root_path = self._get_selected_paths(pane)[0]
+        filter_model = Gtk.TreeModelFilter(
+            child_model=self.model, virtual_root=root_path)
+        paths_to_collapse = []
+        filter_model.foreach(self.append_paths_to_collapse, paths_to_collapse)
+        paths_to_collapse.insert(0, root_path)
+
+        for path in reversed(paths_to_collapse):
+            self.treeview[pane].collapse_row(path)
+
+    def append_paths_to_collapse(
+            self, filter_model, filter_path, filter_iter, paths_to_collapse):
+        path = filter_model.convert_path_to_child_path(filter_path)
+        paths_to_collapse.append(path)
+
+    def action_folder_expand(self, *args):
+        pane = self._get_focused_pane()
+        if pane is None:
+            return
+
+        paths = self._get_selected_paths(pane)
+        for path in paths:
+            self.treeview[pane].expand_row(path, True)
+
+    def action_copy_left(self, *args):
+        self.copy_selected(-1)
+
+    def action_copy_right(self, *args):
+        self.copy_selected(1)
+
+    def action_copy_left_next(self, *args):
+        self.action_copy_left()
+        if self.next_path is not None:
+            self.action_next_change()
+
+    def action_copy_right_next(self, *args):
+        self.action_copy_right()
+        if self.next_path is not None:
+            self.action_next_change()
+
+    def action_swap(self, *args):
+        self.folders.reverse()
         self.refresh()
 
-    def on_filter_state_toggled(self, button):
-        active_action = lambda a: self.actiongroup.get_action(a).get_active()
-        active_filters = [a for a in self.state_actions if \
-                          active_action(self.state_actions[a][1])]
+    def action_delete(self, *args):
+        self.delete_selected()
+
+    def action_open_external(self, *args):
+        pane = self._get_focused_pane()
+        if pane is None:
+            return
+        files = [
+            self.model.value_path(self.model.get_iter(p), pane)
+            for p in self._get_selected_paths(pane)
+        ]
+        files = [f for f in files if f]
+        if files:
+            open_files_external(files)
+
+    def action_copy_file_paths(self, *args):
+        pane = self._get_focused_pane()
+        if pane is None:
+            return
+        files = [
+            self.model.value_path(self.model.get_iter(p), pane)
+            for p in self._get_selected_paths(pane)
+        ]
+        files = [f for f in files if f]
+        if files:
+            clip = Gtk.Clipboard.get_default(Gdk.Display.get_default())
+            clip.set_text('\n'.join(str(f) for f in files), -1)
+            clip.store()
+
+    def action_ignore_case_change(self, action, value):
+        action.set_state(value)
+        self.refresh()
+
+    def action_filter_state_change(self, action, value):
+        action.set_state(value)
+
+        active_filters = [
+            a for a in self.state_actions
+            if self.get_action_state(self.state_actions[a][1])
+        ]
 
         if set(active_filters) == set(self.state_filters):
             return
 
         state_strs = [self.state_actions[s][0] for s in active_filters]
         self.state_filters = active_filters
-        self.prefs.dir_status_filters = state_strs
+        # TODO: Updating the property won't have any effect on its own
+        self.props.status_filters = state_strs
         self.refresh()
 
-    def _update_name_filter(self, button, idx):
-        self.name_filters[idx].active = button.get_active()
+    def _update_name_filter(self, action, state):
+        self._action_name_filter_map[action].active = state.get_boolean()
+        action.set_state(state)
         self.refresh()
-
-    def on_filter_hide_current_clicked(self, button):
-        pane = self._get_focused_pane()
-        if pane is not None:
-            paths = self._get_selected_paths(pane)
-            paths.reverse()
-            for p in paths:
-                self.model.remove( self.model.get_iter(p) )
 
         #
         # Selection
@@ -1161,234 +1672,192 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
 
     def _filter_on_state(self, roots, fileslist):
         """Get state of 'files' for filtering purposes.
-           Returns STATE_NORMAL, STATE_NEW or STATE_MODIFIED
+           Returns STATE_NORMAL, STATE_NOCHANGE, STATE_NEW or STATE_MODIFIED
 
                roots - array of root directories
                fileslist - array of filename tuples of length len(roots)
         """
         assert len(roots) == self.model.ntree
         ret = []
-        regexes = [f.filter for f in self.text_filters if f.active]
+        regexes = [f.byte_filter for f in self.text_filters if f.active]
         for files in fileslist:
-            curfiles = [ os.path.join( r, f ) for r,f in zip(roots,files) ]
-            is_present = [ os.path.exists( f ) for f in curfiles ]
+            curfiles = [os.path.join(r, f) for r, f in zip(roots, files)]
+            is_present = [os.path.exists(f) for f in curfiles]
             all_present = 0 not in is_present
             if all_present:
-                if _files_same(curfiles, regexes, self.prefs) in (Same, SameFiltered):
+                comparison_result = self.file_compare(curfiles, regexes)
+                if comparison_result in (
+                        Same, DodgySame):
                     state = tree.STATE_NORMAL
+                elif comparison_result == SameFiltered:
+                    state = tree.STATE_NOCHANGE
                 else:
                     state = tree.STATE_MODIFIED
             else:
                 state = tree.STATE_NEW
-            if state in self.state_filters:
-                ret.append( files )
+            # Always retain NORMAL folders for comparison; we remove these
+            # later if they have no children.
+            if (state in self.state_filters or
+                    all(os.path.isdir(f) for f in curfiles)):
+                ret.append(files)
         return ret
 
     def _update_item_state(self, it):
-        """Update the state of the item at 'it'
+        """Update the state of a tree row
+
+        All changes and updates to tree rows should happen here;
+        structural changes happen elsewhere, but they only delete rows
+        or add new rows with path information. This function is the
+        only place where row details are changed.
         """
         files = self.model.value_paths(it)
-        regexes = [f.filter for f in self.text_filters if f.active]
+        regexes = [f.byte_filter for f in self.text_filters if f.active]
 
-        def stat(f):
+        def none_stat(f):
             try:
                 return os.stat(f)
             except OSError:
                 return None
-        stats = [stat(f) for f in files[:self.num_panes]]
+        stats = [none_stat(f) for f in files[:self.num_panes]]
         sizes = [s.st_size if s else 0 for s in stats]
         perms = [s.st_mode if s else 0 for s in stats]
+        times = [s.st_mtime if s else 0 for s in stats]
 
-        # find the newest file, checking also that they differ
-        mod_times = [s.st_mtime if s else 0 for s in stats]
-        newest_index = mod_times.index( max(mod_times) )
-        if mod_times.count( max(mod_times) ) == len(mod_times):
-            newest_index = -1 # all same
-        all_present = 0 not in mod_times
-        if all_present:
-            all_same = _files_same(files, regexes, self.prefs)
+        def none_lstat(f):
+            try:
+                return os.lstat(f)
+            except OSError:
+                return None
+
+        lstats = [none_lstat(f) for f in files[:self.num_panes]]
+        symlinks = {
+            i for i, s in enumerate(lstats) if s and stat.S_ISLNK(s.st_mode)
+        }
+
+        def format_name_override(f):
+            source = GLib.markup_escape_text(os.path.basename(f))
+            target = GLib.markup_escape_text(os.readlink(f))
+            return "{} ⟶ {}".format(source, target)
+
+        name_overrides = [
+            format_name_override(f) if i in symlinks else None
+            for i, f in enumerate(files)
+        ]
+
+        existing_times = [s.st_mtime for s in stats if s]
+        newest_time = max(existing_times) if existing_times else 0
+        if existing_times.count(newest_time) == len(existing_times):
+            # If all actually-present files have the same mtime, don't
+            # pretend that any are "newer", and do the same if e.g.,
+            # there's only one file.
+            newest = set()
+        else:
+            newest = {i for i, t in enumerate(times) if t == newest_time}
+
+        if all(stats):
+            all_same = self.file_compare(files, regexes)
             all_present_same = all_same
         else:
-            lof = []
-            for j in range(len(mod_times)):
-                if mod_times[j]:
-                    lof.append( files[j] )
+            lof = [f for f, time in zip(files, times) if time]
             all_same = Different
-            all_present_same = _files_same(lof, regexes, self.prefs)
-        different = 1
-        one_isdir = [None for i in range(self.model.ntree)]
+            all_present_same = self.file_compare(lof, regexes)
+
+        # TODO: Differentiate the DodgySame case
+        if all_same == Same or all_same == DodgySame:
+            state = tree.STATE_NORMAL
+        elif all_same == SameFiltered:
+            state = tree.STATE_NOCHANGE
+        # TODO: Differentiate the SameFiltered and DodgySame cases
+        elif all_present_same in (Same, SameFiltered, DodgySame):
+            state = tree.STATE_NEW
+        elif all_same == FileError or all_present_same == FileError:
+            state = tree.STATE_ERROR
+        # Different and DodgyDifferent
+        else:
+            state = tree.STATE_MODIFIED
+        different = state not in {tree.STATE_NORMAL, tree.STATE_NOCHANGE}
+
+        isdir = [os.path.isdir(files[j]) for j in range(self.model.ntree)]
         for j in range(self.model.ntree):
-            if mod_times[j]:
-                isdir = os.path.isdir( files[j] )
-                # TODO: Differentiate the DodgySame case
-                if all_same == Same or all_same == DodgySame:
-                    self.model.set_path_state(it, j, tree.STATE_NORMAL, isdir)
-                    different = 0
-                elif all_same == SameFiltered:
-                    self.model.set_path_state(it, j, tree.STATE_NOCHANGE, isdir)
-                    different = 0
-                # TODO: Differentiate the SameFiltered and DodgySame cases
-                elif all_present_same in (Same, SameFiltered, DodgySame):
-                    self.model.set_path_state(it, j, tree.STATE_NEW, isdir)
-                elif all_same == FileError or all_present_same == FileError:
-                    self.model.set_path_state(it, j, tree.STATE_ERROR, isdir)
-                # Different and DodgyDifferent
+            if stats[j]:
+                self.model.set_path_state(
+                    it, j, state, isdir[j], display_text=name_overrides[j])
+
+                if self.marked and self.marked.matches_iter(j, it):
+                    emblem = EMBLEM_SELECTED
                 else:
-                    self.model.set_path_state(it, j, tree.STATE_MODIFIED, isdir)
-                self.model.set_value(it,
-                    self.model.column_index(COL_EMBLEM, j),
-                    j == newest_index and "emblem-meld-newer-file" or None)
-                one_isdir[j] = isdir
+                    emblem = EMBLEM_NEW if j in newest else None
 
-                # A DateCellRenderer would be nicer, but potentially very slow
-                TIME = self.model.column_index(COL_TIME, j)
-                mod_datetime = datetime.datetime.fromtimestamp(mod_times[j])
-                time_str = mod_datetime.strftime("%a %d %b %Y %H:%M:%S")
-                self.model.set_value(it, TIME, time_str)
-
-                def natural_size(bytes):
-                    suffixes = (
-                            'B', 'kB', 'MB', 'GB', 'TB', 'PB', 'EB', 'ZB', 'YB'
-                            )
-                    size = float(bytes)
-                    unit = 0
-                    while size > 1000 and unit < len(suffixes) - 1:
-                        size /= 1000
-                        unit += 1
-                    format_str = "%.1f %s" if unit > 0 else "%d %s"
-                    return format_str % (size, suffixes[unit])
-
-                # A SizeCellRenderer would be nicer, but potentially very slow
-                SIZE = self.model.column_index(COL_SIZE, j)
-                size_str = natural_size(sizes[j])
-                self.model.set_value(it, SIZE, size_str)
-
-                def format_mode(mode):
-                    perms = []
-                    rwx = ((4, 'r'), (2, 'w'), (1, 'x'))
-                    for group_index in (6, 3, 0):
-                        group = mode >> group_index & 7
-                        perms.extend([p if group & i else '-' for i, p in rwx])
-                    return "".join(perms)
-
-                PERMS = self.model.column_index(COL_PERMS, j)
-                perm_str = format_mode(perms[j])
-                self.model.set_value(it, PERMS, perm_str)
-
-        for j in range(self.model.ntree):
-            if not mod_times[j]:
-                self.model.set_path_state(it, j, tree.STATE_NONEXIST,
-                                          True in one_isdir)
+                link_emblem = EMBLEM_SYMLINK if j in symlinks else None
+                self.model.unsafe_set(it, j, {
+                    COL_EMBLEM: emblem,
+                    COL_EMBLEM_SECONDARY: link_emblem,
+                    COL_TIME: times[j],
+                    COL_PERMS: perms[j]
+                })
+                # Size is handled independently, because unsafe_set
+                # can't correctly box GObject.TYPE_INT64.
+                self.model.set(
+                    it, self.model.column_index(COL_SIZE, j), sizes[j])
+            else:
+                self.model.set_path_state(
+                    it, j, tree.STATE_NONEXIST, any(isdir))
+                # Set sentinel values for time, size and perms
+                # TODO: change sentinels to float('nan'), pending:
+                #   https://gitlab.gnome.org/GNOME/glib/issues/183
+                self.model.unsafe_set(it, j, {
+                    COL_TIME: MISSING_TIMESTAMP,
+                    COL_SIZE: -1,
+                    COL_PERMS: -1
+                })
         return different
 
-    def popup_in_pane(self, pane, event):
-        for (treeview, inid, outid) in zip(self.treeview, self.focus_in_events, self.focus_out_events):
-            treeview.handler_block(inid)
-            treeview.handler_block(outid)
-        self.actiongroup.get_action("DirCopyLeft").set_sensitive(pane > 0)
-        self.actiongroup.get_action("DirCopyRight").set_sensitive(pane+1 < self.num_panes)
-        if event:
-            button = event.button
-            time = event.time
-        else:
-            button = 0
-            time = gtk.get_current_event_time()
-        self.popup_menu.popup(None, None, None, button, time)
+    def set_num_panes(self, num_panes):
+        if num_panes == self.num_panes or num_panes not in (1, 2, 3):
+            return
 
-    def on_treeview_popup_menu(self, treeview):
-        self.popup_in_pane(self.treeview.index(treeview), None)
-        return True
+        self.model = DirDiffTreeStore(num_panes)
+        self.model.connect("row-deleted", self.on_treemodel_row_deleted)
+        for treeview in self.treeview:
+            treeview.set_model(self.model)
 
-    def on_treeview_button_press_event(self, treeview, event):
-        # Unselect any selected files in other panes
-        for t in [v for v in self.treeview[:self.num_panes] if v != treeview]:
-            t.get_selection().unselect_all()
+        for widget in (
+                self.vbox[:num_panes] + self.pane_actionbar[:num_panes] +
+                self.chunkmap[:num_panes] + self.linkmap[:num_panes - 1] +
+                self.dummy_toolbar_linkmap[:num_panes - 1]):
+            widget.show()
 
-        if event.button == 3:
-            treeview.grab_focus()
-            path = treeview.get_path_at_pos(int(event.x), int(event.y))
-            if path is None:
-                return False
-            selection = treeview.get_selection()
-            model, rows = selection.get_selected_rows()
+        for widget in (
+                self.vbox[num_panes:] + self.pane_actionbar[num_panes:] +
+                self.chunkmap[num_panes:] + self.linkmap[num_panes - 1:] +
+                self.dummy_toolbar_linkmap[num_panes - 1:]):
+            widget.hide()
 
-            if path[0] not in rows:
-                selection.unselect_all()
-                selection.select_path(path[0])
-                treeview.set_cursor(path[0])
-
-            self.popup_in_pane(self.treeview.index(treeview), event)
-            return True
-        return False
-
-    def get_state_traversal(self, diffmapindex):
-        def tree_state_iter():
-            treeindex = (0, self.num_panes-1)[diffmapindex]
-            treeview = self.treeview[treeindex]
-            row_states = []
-            def recurse_tree_states(rowiter):
-                row_states.append(self.model.get_state(rowiter.iter, treeindex))
-                if treeview.row_expanded(rowiter.path):
-                    for row in rowiter.iterchildren():
-                        recurse_tree_states(row)
-            recurse_tree_states(next(iter(self.model)))
-            row_states.append(None)
-
-            numlines = float(len(row_states) - 1)
-            chunkstart, laststate = 0, row_states[0]
-            for index, state in enumerate(row_states):
-                if state != laststate:
-                    action = self.chunk_type_map[laststate]
-                    if action is not None:
-                        yield (action, chunkstart / numlines, index / numlines)
-                    chunkstart, laststate = index, state
-        return tree_state_iter
-
-    def set_num_panes(self, n):
-        if n != self.num_panes and n in (1,2,3):
-            self.model = DirDiffTreeStore(n)
-            for i in range(n):
-                self.treeview[i].set_model(self.model)
-            self.model.connect("row-deleted", self.on_treemodel_row_deleted)
-
-            for (w, i) in zip(self.diffmap, (0, n - 1)):
-                scroll = self.scrolledwindow[i].get_vscrollbar()
-                idx = 1 if i else 0
-                w.setup(scroll, self.get_state_traversal(idx), [self.fill_colors, self.line_colors])
-
-            toshow =  self.scrolledwindow[:n] + self.fileentry[:n]
-            toshow += self.linkmap[:n-1] + self.diffmap[:n]
-            toshow += self.vbox[:n] + self.msgarea_mgr[:n]
-            for widget in toshow:
-                widget.show()
-            tohide =  self.scrolledwindow[n:] + self.fileentry[n:]
-            tohide += self.linkmap[n-1:] + self.diffmap[n:]
-            tohide += self.vbox[n:] + self.msgarea_mgr[n:]
-            for widget in tohide:
-                widget.hide()
-            if self.num_panes != 0: # not first time through
-                self.num_panes = n
-                self.on_fileentry_activate(None)
-            else:
-                self.num_panes = n
+        self.num_panes = num_panes
 
     def refresh(self):
-        root = self.model.get_iter_root()
-        if root:
-            roots = self.model.value_paths(root)
-            self.set_locations( roots )
+        self.set_locations()
 
     def recompute_label(self):
-        root = self.model.get_iter_root()
+        root = self.model.get_iter_first()
         filenames = self.model.value_paths(root)
+        filenames = [f or _('No folder') for f in filenames]
         if self.custom_labels:
-            label_options = zip(self.custom_labels, filenames)
-            shortnames = [l[0] or l[1] for l in label_options]
+            shortnames = [
+                custom or filename for custom, filename in
+                zip(self.custom_labels, filenames)
+            ]
+            tooltip_names = shortnames
         else:
             shortnames = misc.shorten_names(*filenames)
+            tooltip_names = filenames
+
         self.label_text = " : ".join(shortnames)
-        self.tooltip_text = self.label_text
-        self.label_changed()
+        self.tooltip_text = "\n".join((
+            _("Folder comparison:"),
+            *tooltip_names,
+        ))
+        self.label_changed.emit(self.label_text, self.tooltip_text)
 
     def set_labels(self, labels):
         labels = labels[:self.num_panes]
@@ -1398,10 +1867,6 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         self.custom_labels = labels
         self.recompute_label()
 
-    def _update_diffmaps(self):
-        self.diffmap[0].queue_draw()
-        self.diffmap[1].queue_draw()
-
     def on_file_changed(self, changed_filename):
         """When a file has changed, try to find it in our tree
            and update its status if necessary
@@ -1410,7 +1875,7 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
         changed_paths = []
         # search each panes tree for changed_filename
         for pane in range(self.num_panes):
-            it = model.get_iter_root()
+            it = model.get_iter_first()
             current = model.value_path(it, pane).split(os.sep)
             changed = changed_filename.split(os.sep)
             # early exit. does filename begin with root?
@@ -1420,13 +1885,13 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
             except IndexError:
                 continue
             changed = changed[len(current):]
-            # search the tree component at a time
-            for component in changed:
-                child = model.iter_children( it )
+            # search the tree one path part at a time
+            for part in changed:
+                child = model.iter_children(it)
                 while child:
                     child_path = model.value_path(child, pane)
                     # Found the changed path
-                    if child_path and component == os.path.basename(child_path):
+                    if child_path and part == os.path.basename(child_path):
                         it = child
                         break
                     child = self.model.iter_next(child)
@@ -1439,29 +1904,51 @@ class DirDiff(melddoc.MeldDoc, gnomeglade.Component):
                     changed_paths.append(path)
         # do the update
         for path in changed_paths:
-            self._update_item_state( model.get_iter(path) )
+            self._update_item_state(model.get_iter(path))
+        self.force_cursor_recalculate = True
+
+    @Gtk.Template.Callback()
+    def on_linkmap_scroll_event(self, linkmap, event):
+        self.next_diff(event.direction)
 
     def next_diff(self, direction):
         if self.focus_pane:
             pane = self.treeview.index(self.focus_pane)
         else:
             pane = 0
-        if direction == gtk.gdk.SCROLL_UP:
+        if direction == Gdk.ScrollDirection.UP:
             path = self.prev_path
         else:
             path = self.next_path
         if path:
             self.treeview[pane].expand_to_path(path)
             self.treeview[pane].set_cursor(path)
+        else:
+            self.error_bell()
 
-    def on_refresh_activate(self, *extra):
-        self.on_fileentry_activate(None)
+    def action_previous_change(self, *args):
+        self.next_diff(Gdk.ScrollDirection.UP)
 
-    def on_delete_event(self, appquit=0):
-        for h in self.app_handlers:
-            app.disconnect(h)
+    def action_next_change(self, *args):
+        self.next_diff(Gdk.ScrollDirection.DOWN)
 
-        return gtk.RESPONSE_OK
+    def action_refresh(self, *args):
+        self.refresh()
 
-    def on_find_activate(self, *extra):
+    def on_delete_event(self):
+        meld_settings = get_meld_settings()
+        for h in self.settings_handlers:
+            meld_settings.disconnect(h)
+        self.close_signal.emit(0)
+        return Gtk.ResponseType.OK
+
+    def action_find(self, *args):
         self.focus_pane.emit("start-interactive-search")
+
+    def auto_compare(self):
+        modified_states = (tree.STATE_MODIFIED, tree.STATE_CONFLICT)
+        for it in self.model.state_rows(modified_states):
+            self.run_diff_from_iter(it)
+
+
+DirDiff.set_css_name('meld-folder-diff')

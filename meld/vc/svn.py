@@ -1,45 +1,44 @@
-### Copyright (C) 2002-2005 Stephen Kennedy <stevek@gnome.org>
-### Copyright (C) 2011-2012 Kai Willadsen <kai.willadsen@gmail.com>
+# Copyright (C) 2002-2005 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2011-2013, 2015 Kai Willadsen <kai.willadsen@gmail.com>
 
-### Redistribution and use in source and binary forms, with or without
-### modification, are permitted provided that the following conditions
-### are met:
-### 
-### 1. Redistributions of source code must retain the above copyright
-###    notice, this list of conditions and the following disclaimer.
-### 2. Redistributions in binary form must reproduce the above copyright
-###    notice, this list of conditions and the following disclaimer in the
-###    documentation and/or other materials provided with the distribution.
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
 
-### THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
-### IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
-### OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
-### IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
-### INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
-### NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-### DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-### THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-### (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
-### THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import errno
 import glob
 import os
-import shutil
-import tempfile
 import xml.etree.ElementTree as ElementTree
 
+from meld.conf import _
 from . import _vc
 
+#: Simple enum constants for differentiating conflict cases.
+CONFLICT_TYPE_MERGE, CONFLICT_TYPE_UPDATE = 1, 2
 
-class Vc(_vc.CachedVc):
+
+class Vc(_vc.Vc):
 
     CMD = "svn"
     NAME = "Subversion"
     VC_DIR = ".svn"
-    VC_ROOT_WALK = False
-
-    VC_COLUMNS = (_vc.DATA_NAME, _vc.DATA_STATE, _vc.DATA_REVISION)
 
     state_map = {
         "unversioned": _vc.STATE_NONE,
@@ -52,50 +51,46 @@ class Vc(_vc.CachedVc):
         "conflicted": _vc.STATE_CONFLICT,
     }
 
-    def commit_command(self, message):
-        return [self.CMD,"commit","-m",message]
+    def commit(self, runner, files, message):
+        command = [self.CMD, 'commit', '-m', message]
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def update_command(self):
-        return [self.CMD,"update"]
-    def add_command(self):
-        return [self.CMD,"add"]
-    def remove_command(self, force=0):
-        return [self.CMD,"rm","--force"]
-    def revert_command(self):
-        return [self.CMD,"revert"]
-    def resolved_command(self):
-        return [self.CMD,"resolved"]
+    def update(self, runner):
+        command = [self.CMD, 'update']
+        runner(command, [], refresh=True, working_dir=self.root)
+
+    def remove(self, runner, files):
+        command = [self.CMD, 'rm', '--force']
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    def revert(self, runner, files):
+        command = [self.CMD, 'revert']
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    def resolve(self, runner, files):
+        command = [self.CMD, 'resolve', '--accept=working']
+        runner(command, files, refresh=True, working_dir=self.root)
 
     def get_path_for_repo_file(self, path, commit=None):
-        if commit is not None:
+        if commit is None:
+            commit = "BASE"
+        else:
             raise NotImplementedError()
 
         if not path.startswith(self.root + os.path.sep):
             raise _vc.InvalidVCPath(self, path, "Path not in repository")
         path = path[len(self.root) + 1:]
 
-        base, fname = os.path.split(path)
-        svn_path = os.path.join(base, ".svn", "text-base", fname + ".svn-base")
-
-        with tempfile.NamedTemporaryFile(prefix='meld-tmp', delete=False) as f:
-            try:
-                with open(svn_path, 'r') as vc_file:
-                    shutil.copyfileobj(vc_file, f)
-            except IOError as err:
-                if err.errno != errno.ENOENT:
-                    raise
-                # If the repository path doesn't exist, we either have an
-                # invalid path (difficult to check) or a new file. Either way,
-                # we just return an empty file
-
-        return f.name
+        suffix = os.path.splitext(path)[1]
+        args = [self.CMD, "cat", "-r", commit, path]
+        return _vc.call_temp_output(args, cwd=self.root, suffix=suffix)
 
     def get_path_for_conflict(self, path, conflict=None):
         """
         SVN has two types of conflicts:
         Merge conflicts, which give 3 files:
            .left.r* (THIS)
-           .working (BASE... although this is a bit debateable)
+           .working (BASE... although this is a bit debatable)
            .right.r* (OTHER)
         Update conflicts which give 3 files:
            .mine (THIS)
@@ -108,9 +103,6 @@ class Vc(_vc.CachedVc):
         # If this is merged, we just return the merged output
         if conflict == _vc.CONFLICT_MERGED:
             return path, False
-
-        CONFLICT_TYPE_MERGE = 1
-        CONFLICT_TYPE_UPDATE = 2
 
         # First fine what type of conflict this is by looking at the base
         # we can possibly return straight away!
@@ -143,91 +135,71 @@ class Vc(_vc.CachedVc):
 
         raise KeyError("Conflict file does not exist")
 
-    def _repo_version_support(self, version):
-        return version < 12
+    def add(self, runner, files):
+        # SVN < 1.7 needs to add folders from their immediate parent
+        dirs = [s for s in files if os.path.isdir(s)]
+        files = [s for s in files if os.path.isfile(s)]
+        command = [self.CMD, 'add']
+        for path in dirs:
+            runner(command, [path], refresh=True,
+                   working_dir=os.path.dirname(path))
+        if files:
+            runner(command, files, refresh=True, working_dir=self.location)
 
-    def valid_repo(self):
-        if _vc.call([self.CMD, "info"], cwd=self.root):
+    @classmethod
+    def _repo_version_support(cls, version):
+        return version >= 12
+
+    @classmethod
+    def valid_repo(cls, path):
+        if _vc.call([cls.CMD, "info"], cwd=path):
             return False
+
+        root, location = cls.is_in_repo(path)
+        vc_dir = os.path.join(root, cls.VC_DIR)
 
         # Check for repository version, trusting format file then entries file
-        format_path = os.path.join(self.root, self.VC_DIR, "format")
-        entries_path = os.path.join(self.root, self.VC_DIR, "entries")
-        if os.path.exists(format_path):
-            version_file = format_path
-        elif os.path.exists(entries_path):
-            version_file = entries_path
-        else:
-            return False
+        repo_version = None
+        for filename in ("format", "entries"):
+            path = os.path.join(vc_dir, filename)
+            if os.path.exists(path):
+                with open(path) as f:
+                    repo_version = int(f.readline().strip())
+                break
 
-        with open(version_file) as f:
-            content = f.readline().strip()
-        return self._repo_version_support(int(content))
+        if not repo_version and os.path.exists(os.path.join(vc_dir, "wc.db")):
+            repo_version = 12
 
-    def _update_tree_state_cache(self, path, tree_state):
+        return cls._repo_version_support(repo_version)
+
+    def _update_tree_state_cache(self, path):
         while 1:
             try:
-                status_cmd = [self.CMD, "status", "-v", "--xml", path]
-                tree = ElementTree.parse(_vc.popen(status_cmd))
+                # "svn --xml" outputs utf8, even with Windows non-utf8 locale
+                proc = _vc.popen(
+                    [self.CMD, "status", "-v", "--xml", path],
+                    cwd=self.location, use_locale_encoding=False)
+                tree = ElementTree.parse(proc)
                 break
             except OSError as e:
                 if e.errno != errno.EAGAIN:
                     raise
 
         for target in tree.findall("target") + tree.findall("changelist"):
-            for entry in (t for t in target.getchildren() if t.tag == "entry"):
+            for entry in target.iter(tag="entry"):
                 path = entry.attrib["path"]
-                if path == "":
+                if not path:
                     continue
-                for status in (e for e in entry.getchildren() \
-                               if e.tag == "wc-status"):
+                if not os.path.isabs(path):
+                    path = os.path.abspath(os.path.join(self.location, path))
+                for status in entry.iter(tag="wc-status"):
                     item = status.attrib["item"]
                     if item == "":
                         continue
-                    rev = None
-                    if "revision" in status.attrib:
-                        rev = status.attrib["revision"]
-                    mydir, name = os.path.split(path)
-                    if mydir not in tree_state:
-                        tree_state[mydir] = {}
-                    tree_state[mydir][name] = (item, rev)
+                    state = self.state_map.get(item, _vc.STATE_NONE)
+                    self._tree_cache[path] = state
 
-    def _lookup_tree_cache(self, rootdir):
-        # Get a list of all files in rootdir, as well as their status
-        tree_state = {}
-        self._update_tree_state_cache(rootdir, tree_state)
-        return tree_state
-
-    def update_file_state(self, path):
-        tree_state = self._get_tree_cache(os.path.dirname(path))
-        self._update_tree_state_cache(path, tree_state)
-
-    def _get_dirsandfiles(self, directory, dirs, files):
-        tree = self._get_tree_cache(directory)
-
-        if not directory in tree:
-            return [], []
-
-        retfiles = []
-        retdirs = []
-
-        dirtree = tree[directory]
-
-        for name in sorted(dirtree.keys()):
-            svn_state, rev = dirtree[name]
-            path = os.path.join(directory, name)
-
-            isdir = os.path.isdir(path)
-            if isdir:
-                if os.path.exists(path):
-                    state = _vc.STATE_NORMAL
-                else:
-                    state = _vc.STATE_MISSING
-                # svn adds the directory reported to the status list we get.
-                if name != directory:
-                    retdirs.append( _vc.Dir(path,name,state) )
-            else:
-                state = self.state_map.get(svn_state, _vc.STATE_NONE)
-                retfiles.append(_vc.File(path, name, state, rev))
-
-        return retdirs, retfiles
+                    rev = status.attrib.get("revision")
+                    rev_label = _("Rev %s") % rev if rev is not None else ''
+                    self._tree_meta_cache[path] = rev_label
+                    self._add_missing_cache_entry(path, state)

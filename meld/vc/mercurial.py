@@ -1,4 +1,5 @@
 # Copyright (C) 2002-2005 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2015 Kai Willadsen <kai.willadsen@gmail.com>
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -23,14 +24,11 @@
 
 import errno
 import os
-import shutil
-import subprocess
-import tempfile
 
 from . import _vc
 
 
-class Vc(_vc.CachedVc):
+class Vc(_vc.Vc):
 
     CMD = "hg"
     NAME = "Mercurial"
@@ -46,32 +44,29 @@ class Vc(_vc.CachedVc):
         "R": _vc.STATE_REMOVED,
     }
 
-    def commit_command(self, message):
-        return [self.CMD, "commit", "-m", message]
+    def commit(self, runner, files, message):
+        command = [self.CMD, 'commit', '-m', message]
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def update_command(self):
-        return [self.CMD, "update"]
+    def update(self, runner):
+        command = [self.CMD, 'pull', '-u']
+        runner(command, [], refresh=True, working_dir=self.root)
 
-    def add_command(self):
-        return [self.CMD, "add"]
+    def add(self, runner, files):
+        command = [self.CMD, 'add']
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def remove_command(self, force=0):
-        return [self.CMD, "rm"]
+    def remove(self, runner, files):
+        command = [self.CMD, 'rm']
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def revert_command(self):
-        return [self.CMD, "revert"]
+    def revert(self, runner, files):
+        command = [self.CMD, 'revert']
+        runner(command, files, refresh=True, working_dir=self.root)
 
-    def valid_repo(self):
-        if _vc.call([self.CMD, "root"], cwd=self.root):
-            return False
-        else:
-            return True
-
-    def get_working_directory(self, workdir):
-        if workdir.startswith("/"):
-            return self.root
-        else:
-            return ''
+    @classmethod
+    def valid_repo(cls, path):
+        return not _vc.call([cls.CMD, "root"], cwd=path)
 
     def get_path_for_repo_file(self, path, commit=None):
         if commit is not None:
@@ -81,16 +76,12 @@ class Vc(_vc.CachedVc):
             raise _vc.InvalidVCPath(self, path, "Path not in repository")
         path = path[len(self.root) + 1:]
 
-        process = subprocess.Popen([self.CMD, "cat", path], cwd=self.root,
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
+        suffix = os.path.splitext(path)[1]
+        args = [self.CMD, "cat", path]
+        return _vc.call_temp_output(args, cwd=self.root, suffix=suffix)
 
-        with tempfile.NamedTemporaryFile(prefix='meld-tmp', delete=False) as f:
-            shutil.copyfileobj(process.stdout, f)
-        return f.name
-
-    def _update_tree_state_cache(self, path, tree_state):
-        """ Update the state of the file(s) at tree_state['path'] """
+    def _update_tree_state_cache(self, path):
+        """ Update the state of the file(s) at self._tree_cache['path'] """
         while 1:
             try:
                 # Get the status of modified files
@@ -108,12 +99,12 @@ class Vc(_vc.CachedVc):
 
         if len(entries) == 0 and os.path.isfile(path):
             # If we're just updating a single file there's a chance that it
-            # was it was previously modified, and now has been edited
-            # so that it is un-modified.  This will result in an empty
-            # 'entries' list, and tree_state['path'] will still contain stale
-            # data.  When this corner case occurs we force tree_state['path']
+            # was it was previously modified, and now has been edited so that
+            # it is un-modified.  This will result in an empty 'entries' list,
+            # and self._tree_cache['path'] will still contain stale data.
+            # When this corner case occurs we force self._tree_cache['path']
             # to STATE_NORMAL.
-            tree_state[path] = _vc.STATE_NORMAL
+            self._tree_cache[path] = _vc.STATE_NORMAL
         else:
             # There are 1 or more modified files, parse their state
             for entry in entries:
@@ -121,35 +112,5 @@ class Vc(_vc.CachedVc):
                 statekey, name = entry.split(" ", 1)
                 path = os.path.join(self.location, name.strip())
                 state = self.state_map.get(statekey.strip(), _vc.STATE_NONE)
-                tree_state[path] = state
-
-    def _lookup_tree_cache(self, rootdir):
-        # Get a list of all files in rootdir, as well as their status
-        tree_state = {}
-        self._update_tree_state_cache("./", tree_state)
-
-        return tree_state
-
-    def update_file_state(self, path):
-        tree_state = self._get_tree_cache(os.path.dirname(path))
-        self._update_tree_state_cache(path, tree_state)
-
-    def _get_dirsandfiles(self, directory, dirs, files):
-
-        tree = self._get_tree_cache(directory)
-
-        retfiles = []
-        retdirs = []
-        for name, path in files:
-            state = tree.get(path, _vc.STATE_NORMAL)
-            retfiles.append(_vc.File(path, name, state))
-        for name, path in dirs:
-            # mercurial does not operate on dirs, just files
-            retdirs.append(_vc.Dir(path, name, _vc.STATE_NORMAL))
-        for path, state in tree.items():
-            # removed files are not in the filesystem, so must be added here
-            if state in (_vc.STATE_REMOVED, _vc.STATE_MISSING):
-                folder, name = os.path.split(path)
-                if folder == directory:
-                    retfiles.append(_vc.File(path, name, state))
-        return retdirs, retfiles
+                self._tree_cache[path] = state
+                self._add_missing_cache_entry(path, state)

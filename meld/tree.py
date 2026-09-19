@@ -1,70 +1,92 @@
-### Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
-
-### This program is free software; you can redistribute it and/or modify
-### it under the terms of the GNU General Public License as published by
-### the Free Software Foundation; either version 2 of the License, or
-### (at your option) any later version.
-
-### This program is distributed in the hope that it will be useful,
-### but WITHOUT ANY WARRANTY; without even the implied warranty of
-### MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-### GNU General Public License for more details.
-
-### You should have received a copy of the GNU General Public License
-### along with this program; if not, write to the Free Software
-### Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
-### USA.
+# Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2011-2015 Kai Willadsen <kai.willadsen@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import os
-import gobject
-import gtk
-import pango
+
+from gi.module import get_introspection_module
+from gi.repository import Gdk, GLib, GObject, Pango
+
+from meld.style import colour_lookup_with_fallback
+from meld.treehelpers import SearchableTreeStore
+from meld.vc._vc import (  # noqa: F401
+    CONFLICT_BASE,
+    CONFLICT_LOCAL,
+    CONFLICT_MERGED,
+    CONFLICT_OTHER,
+    CONFLICT_REMOTE,
+    CONFLICT_THIS,
+    STATE_CONFLICT,
+    STATE_EMPTY,
+    STATE_ERROR,
+    STATE_IGNORED,
+    STATE_MAX,
+    STATE_MISSING,
+    STATE_MODIFIED,
+    STATE_NEW,
+    STATE_NOCHANGE,
+    STATE_NONE,
+    STATE_NONEXIST,
+    STATE_NORMAL,
+    STATE_REMOVED,
+    STATE_SPINNER,
+)
+
+_GIGtk = None
+
+try:
+    _GIGtk = get_introspection_module('Gtk')
+except Exception:
+    pass
 
 COL_PATH, COL_STATE, COL_TEXT, COL_ICON, COL_TINT, COL_FG, COL_STYLE, \
     COL_WEIGHT, COL_STRIKE, COL_END = list(range(10))
 
-COL_TYPES = (str, str, str, str, str, gtk.gdk.Color, pango.Style,
-             pango.Weight, bool)
+COL_TYPES = (str, str, str, str, Gdk.RGBA, Gdk.RGBA, Pango.Style,
+             Pango.Weight, bool)
 
 
-from meld.vc._vc import \
-    STATE_IGNORED, STATE_NONE, STATE_NORMAL, STATE_NOCHANGE, \
-    STATE_ERROR, STATE_EMPTY, STATE_NEW, \
-    STATE_MODIFIED, STATE_CONFLICT, STATE_REMOVED, \
-    STATE_MISSING, STATE_NONEXIST, STATE_MAX, \
-    CONFLICT_BASE, CONFLICT_LOCAL, CONFLICT_REMOTE, \
-    CONFLICT_MERGED, CONFLICT_OTHER, CONFLICT_THIS
-
-
-class DiffTreeStore(gtk.TreeStore):
+class DiffTreeStore(SearchableTreeStore):
 
     def __init__(self, ntree, types):
         full_types = []
         for col_type in (COL_TYPES + tuple(types)):
             full_types.extend([col_type] * ntree)
-        gtk.TreeStore.__init__(self, *full_types)
+        super().__init__(*full_types)
+        self._none_of_cols = {
+            col_num: GObject.Value(col_type, None)
+            for col_num, col_type in enumerate(full_types)
+        }
         self.ntree = ntree
         self._setup_default_styles()
 
-    def on_style_set(self, widget, prev_style):
-        style = widget.get_style()
+    def on_style_updated(self, widget):
+        style = widget.get_style_context()
         self._setup_default_styles(style)
 
     def _setup_default_styles(self, style=None):
-        roman, italic = pango.STYLE_NORMAL, pango.STYLE_ITALIC
-        normal, bold = pango.WEIGHT_NORMAL, pango.WEIGHT_BOLD
+        roman, italic = Pango.Style.NORMAL, Pango.Style.ITALIC
+        normal, bold = Pango.Weight.NORMAL, Pango.Weight.BOLD
 
-        if style:
-            lookup = lambda color_id, default: style.lookup_color(color_id)
-        else:
-            lookup = lambda color_id, default: gtk.gdk.color_parse(default)
-
-        unk_fg = lookup("unknown-text", "#888888")
-        new_fg = lookup("insert-text", "#008800")
-        mod_fg = lookup("replace-text", "#0044dd")
-        del_fg = lookup("delete-text", "#880000")
-        err_fg = lookup("error-text", "#ffff00")
-        con_fg = lookup("conflict-text", "#ff0000")
+        lookup = colour_lookup_with_fallback
+        unk_fg = lookup("meld:unknown-text", "foreground")
+        new_fg = lookup("meld:insert", "foreground")
+        mod_fg = lookup("meld:replace", "foreground")
+        del_fg = lookup("meld:delete", "foreground")
+        err_fg = lookup("meld:error", "foreground")
+        con_fg = lookup("meld:conflict", "foreground")
 
         self.text_attributes = [
             # foreground, style, weight, strikethrough
@@ -76,10 +98,12 @@ class DiffTreeStore(gtk.TreeStore):
             (unk_fg, italic, normal, None),  # STATE_EMPTY
             (new_fg, roman,  bold,   None),  # STATE_NEW
             (mod_fg, roman,  bold,   None),  # STATE_MODIFIED
+            (mod_fg, roman,  normal, None),  # STATE_RENAMED
             (con_fg, roman,  bold,   None),  # STATE_CONFLICT
             (del_fg, roman,  bold,   True),  # STATE_REMOVED
             (del_fg, roman,  bold,   True),  # STATE_MISSING
             (unk_fg, roman,  normal, True),  # STATE_NONEXIST
+            (None,   italic, normal, None),  # STATE_SPINNER
         ]
 
         self.icon_details = [
@@ -88,14 +112,16 @@ class DiffTreeStore(gtk.TreeStore):
             ("text-x-generic", "folder", None,   None),    # NONE
             ("text-x-generic", "folder", None,   None),    # NORMAL
             ("text-x-generic", "folder", None,   None),    # NOCHANGE
-            ("dialog-warning", None    , None,   None),    # ERROR
-            (None,             None    , None,   None),    # EMPTY
+            ("dialog-warning-symbolic", None,     None,   None),    # ERROR
+            (None,             None,     None,   None),    # EMPTY
             ("text-x-generic", "folder", new_fg, None),    # NEW
             ("text-x-generic", "folder", mod_fg, None),    # MODIFIED
+            ("text-x-generic", "folder", mod_fg, None),    # RENAMED
             ("text-x-generic", "folder", con_fg, None),    # CONFLICT
             ("text-x-generic", "folder", del_fg, None),    # REMOVED
             ("text-x-generic", "folder", unk_fg, unk_fg),  # MISSING
             ("text-x-generic", "folder", unk_fg, unk_fg),  # NONEXIST
+            ("text-x-generic", "folder", None,   None),    # SPINNER
         ]
 
         assert len(self.icon_details) == len(self.text_attributes) == STATE_MAX
@@ -104,131 +130,176 @@ class DiffTreeStore(gtk.TreeStore):
         return [self.value_path(it, i) for i in range(self.ntree)]
 
     def value_path(self, it, pane):
-        path = self.get_value(it, self.column_index(COL_PATH, pane))
-        if path is not None:
-            path = path.decode('utf8')
-        return path
+        return self.get_value(it, self.column_index(COL_PATH, pane))
+
+    def is_folder(self, it, pane, path):
+        # A folder may no longer exist, and is only tracked by VC.
+        # Therefore, check the icon instead, as the pane already knows.
+        icon = self.get_value(it, self.column_index(COL_ICON, pane))
+        return icon == "folder" or (bool(path) and os.path.isdir(path))
 
     def column_index(self, col, pane):
         return self.ntree * col + pane
 
     def add_entries(self, parent, names):
-        child = self.append(parent)
+        it = self.append(parent)
         for pane, path in enumerate(names):
-            self.set_value(child, self.column_index(COL_PATH, pane), path)
-        return child
+            self.unsafe_set(it, pane, {COL_PATH: path})
+        return it
 
     def add_empty(self, parent, text="empty folder"):
         it = self.append(parent)
         for pane in range(self.ntree):
-            self.set_value(it, self.column_index(COL_PATH, pane), None)
             self.set_state(it, pane, STATE_EMPTY, text)
+        return it
 
-    def add_error(self, parent, msg, pane):
+    def add_error(self, parent, msg, pane, defaults={}):
         it = self.append(parent)
+        key_values = {COL_STATE: str(STATE_ERROR)}
+        key_values.update(defaults)
         for i in range(self.ntree):
-            self.set_value(it, self.column_index(COL_STATE, i),
-                           str(STATE_ERROR))
+            self.unsafe_set(it, i, key_values)
         self.set_state(it, pane, STATE_ERROR, msg)
 
-    def set_path_state(self, it, pane, state, isdir=0):
-        fullname = self.get_value(it, self.column_index(COL_PATH,pane))
-        name = gobject.markup_escape_text(os.path.basename(fullname))
-        self.set_state(it, pane, state, name, isdir)
+    def set_path_state(self, it, pane, state, isdir=0, display_text=None):
+        if not display_text:
+            fullname = self.get_value(it, self.column_index(COL_PATH, pane))
+            display_text = GLib.markup_escape_text(os.path.basename(fullname))
+        self.set_state(it, pane, state, display_text, isdir)
 
     def set_state(self, it, pane, state, label, isdir=0):
-        col_idx = self.column_index
         icon = self.icon_details[state][1 if isdir else 0]
         tint = self.icon_details[state][3 if isdir else 2]
-        self.set_value(it, col_idx(COL_STATE, pane), str(state))
-        self.set_value(it, col_idx(COL_TEXT,  pane), label)
-        self.set_value(it, col_idx(COL_ICON,  pane), icon)
-        self.set_value(it, col_idx(COL_TINT,  pane), tint)
-
         fg, style, weight, strike = self.text_attributes[state]
-        self.set_value(it, col_idx(COL_FG, pane), fg)
-        self.set_value(it, col_idx(COL_STYLE, pane), style)
-        self.set_value(it, col_idx(COL_WEIGHT, pane), weight)
-        self.set_value(it, col_idx(COL_STRIKE, pane), strike)
+        self.unsafe_set(it, pane, {
+            COL_STATE: str(state),
+            COL_TEXT: label,
+            COL_ICON: icon,
+            COL_TINT: tint,
+            COL_FG: fg,
+            COL_STYLE: style,
+            COL_WEIGHT: weight,
+            COL_STRIKE: strike
+        })
 
     def get_state(self, it, pane):
-        STATE = self.column_index(COL_STATE, pane)
+        state_idx = self.column_index(COL_STATE, pane)
         try:
-            return int(self.get_value(it, STATE))
+            return int(self.get_value(it, state_idx))
         except TypeError:
             return None
 
-    def inorder_search_down(self, it):
-        while it:
-            child = self.iter_children(it)
-            if child:
-                it = child
-            else:
-                next = self.iter_next(it)
-                if next:
-                    it = next
-                else:
-                    while 1:
-                        it = self.iter_parent(it)
-                        if it:
-                            next = self.iter_next(it)
-                            if next:
-                                it = next
-                                break
-                        else:
-                            raise StopIteration()
-            yield it
-
-    def inorder_search_up(self, it):
-        while it:
-            path = self.get_path(it)
-            if path[-1]:
-                path = path[:-1] + (path[-1]-1,)
-                it = self.get_iter(path)
-                while 1:
-                    nc = self.iter_n_children(it)
-                    if nc:
-                        it = self.iter_nth_child(it, nc-1)
-                    else:
-                        break
-            else:
-                up = self.iter_parent(it)
-                if up:
-                    it = up
-                else:
-                    raise StopIteration()
-            yield it
-
     def _find_next_prev_diff(self, start_path):
-        prev_path, next_path = None, None
-        start_iter = self.get_iter(start_path)
+        def match_func(it):
+            # TODO: It works, but matching on the first pane only is very poor
+            return self.get_state(it, 0) not in (
+                STATE_NORMAL, STATE_NOCHANGE, STATE_EMPTY)
 
-        for it in self.inorder_search_up(start_iter):
+        return self.get_previous_next_paths(start_path, match_func)
+
+    def state_rows(self, states):
+        """Generator of rows in one of the given states
+
+        Tree iterators are returned in depth-first tree order.
+        """
+        root = self.get_iter_first()
+        for it in self.inorder_search_down(root):
             state = self.get_state(it, 0)
-            if state not in (STATE_NORMAL, STATE_EMPTY):
-                prev_path = self.get_path(it)
-                break
+            if state in states:
+                yield it
 
-        for it in self.inorder_search_down(start_iter):
-            state = self.get_state(it, 0)
-            if state not in (STATE_NORMAL, STATE_EMPTY):
-                next_path = self.get_path(it)
-                break
+    def unsafe_set(self, treeiter, pane, keys_values):
+        """ This must be fastest than super.set,
+        at the cost that may crash the application if you don't
+        know what your're passing here.
+        ie: pass treeiter or column as None crash meld
 
-        return prev_path, next_path
+        treeiter: Gtk.TreeIter
+        keys_values: dict<column, value>
+            column: Int col index
+            value: Str (UTF-8), Int, Float, Double, Boolean, None or GObject
 
-    def treeview_search_cb(self, model, column, key, it):
-        # If the key contains a path separator, search the whole path,
-        # otherwise just use the filename. If the key is all lower-case, do a
-        # case-insensitive match.
-        abs_search = key.find('/') >= 0
-        lower_key = key.islower()
+        return None
+        """
+        safe_keys_values = {
+            self.column_index(col, pane):
+            val if val is not None
+            else self._none_of_cols.get(self.column_index(col, pane))
+            for col, val in keys_values.items()
+        }
+        if _GIGtk and treeiter:
+            columns = [col for col in safe_keys_values.keys()]
+            values = [val for val in safe_keys_values.values()]
+            _GIGtk.TreeStore.set(self, treeiter, columns, values)
+        else:
+            self.set(treeiter, safe_keys_values)
 
-        for path in model.value_paths(it):
-            if not path:
-                continue
-            lineText = path if abs_search else os.path.basename(path)
-            lineText = lineText.lower() if lower_key else lineText
-            if lineText.find(key) != -1:
-                return False
+
+class TreeviewCommon:
+
+    def on_treeview_popup_menu(self, treeview):
+        cursor_path, cursor_col = treeview.get_cursor()
+        if not cursor_path:
+            self.popup_menu.popup_at_pointer(None)
+            return True
+
+        # We always want to pop up to the right of the first column,
+        # ignoring the actual cursor column location.
+        rect = treeview.get_background_area(
+            cursor_path, treeview.get_column(0))
+
+        self.popup_menu.popup_at_rect(
+            treeview.get_bin_window(),
+            rect,
+            Gdk.Gravity.SOUTH_EAST,
+            Gdk.Gravity.NORTH_WEST,
+            None,
+        )
         return True
+
+    def on_treeview_button_press_event(self, treeview, event):
+
+        # If we have multiple treeviews, unselect clear other tree selections
+        num_panes = getattr(self, 'num_panes', 1)
+        if num_panes > 1:
+            for t in self.treeview[:self.num_panes]:
+                if t != treeview:
+                    t.get_selection().unselect_all()
+
+        if (event.triggers_context_menu() and
+                event.type == Gdk.EventType.BUTTON_PRESS):
+
+            treeview.grab_focus()
+
+            path = treeview.get_path_at_pos(int(event.x), int(event.y))
+            if path is None:
+                return False
+
+            selection = treeview.get_selection()
+            model, rows = selection.get_selected_rows()
+
+            if path[0] not in rows:
+                selection.unselect_all()
+                selection.select_path(path[0])
+                treeview.set_cursor(path[0])
+
+            self.popup_menu.popup_at_pointer(event)
+            return True
+        return False
+
+
+def treeview_search_cb(model, column, key, it, data):
+    # If the key contains a path separator, search the whole path,
+    # otherwise just use the filename. If the key is all lower-case, do a
+    # case-insensitive match.
+    abs_search = '/' in key
+    lower_key = key.islower()
+
+    for path in model.value_paths(it):
+        if not path:
+            continue
+        text = path if abs_search else os.path.basename(path)
+        text = text.lower() if lower_key else text
+        if key in text:
+            return False
+    return True

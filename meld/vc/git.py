@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
 # Copyright (C) 2002-2005 Stephen Kennedy <stevek@gnome.org>
 # Copyright (C) 2005 Aaron Bentley <aaron.bentley@utoronto.ca>
 # Copyright (C) 2007 José Fonseca <j_r_fonseca@yahoo.co.uk>
-# Copyright (C) 2010-2013 Kai Willadsen <kai.willadsen@gmail.com>
+# Copyright (C) 2010-2015 Kai Willadsen <kai.willadsen@gmail.com>
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -25,26 +24,30 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 # THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import codecs
 import errno
+import io
 import os
 import re
 import shutil
-import subprocess
+import stat
 import tempfile
+from collections import defaultdict
 
-from gettext import gettext as _, ngettext
-
+from meld.conf import _, ngettext
 from . import _vc
 
+NULL_SHA = "0000000000000000000000000000000000000000"
 
-class Vc(_vc.CachedVc):
+
+class Vc(_vc.Vc):
 
     CMD = "git"
     NAME = "Git"
     VC_DIR = ".git"
-    GIT_DIFF_FILES_RE = ":(\d+) (\d+) [a-z0-9]+ [a-z0-9]+ ([ADMU])\t(.*)"
 
-    VC_COLUMNS = (_vc.DATA_NAME, _vc.DATA_STATE, _vc.DATA_OPTIONS)
+    DIFF_FILES_RE = r":(\d+) (\d+) ([a-z0-9]+) ([a-z0-9]+) ([XADMTU])\t(.*)"
+    DIFF_RE = re.compile(DIFF_FILES_RE)
 
     conflict_map = {
         # These are the arguments for git-show
@@ -63,51 +66,19 @@ class Vc(_vc.CachedVc):
         "U": _vc.STATE_CONFLICT,  # Unmerged
     }
 
-    def __init__(self, location):
-        super(Vc, self).__init__(location)
-        self.diff_re = re.compile(self.GIT_DIFF_FILES_RE)
-        self._tree_cache = {}
-        self._tree_meta_cache = {}
+    @classmethod
+    def is_installed(cls):
+        try:
+            proc = _vc.popen([cls.CMD, '--version'])
+            assert proc.read().startswith('git version')
+            return True
+        except Exception:
+            return False
 
-    def check_repo_root(self, location):
+    @classmethod
+    def check_repo_root(cls, location):
         # Check exists instead of isdir, since .git might be a git-file
-        if not os.path.exists(os.path.join(location, self.VC_DIR)):
-            raise ValueError
-        return location
-
-    def commit_command(self, message):
-        return [self.CMD, "commit", "-m", message]
-
-    def add_command(self):
-        return [self.CMD, "add"]
-
-    # Prototyping VC interface version 2
-
-    def update_actions_for_paths(self, path_states, actions):
-        states = path_states.values()
-
-        actions["VcCompare"] = bool(path_states)
-        # TODO: We can't disable this for NORMAL, because folders don't
-        # inherit any state from their children, but committing a folder with
-        # modified children is expected behaviour.
-        actions["VcCommit"] = all(s not in (
-            _vc.STATE_NONE, _vc.STATE_IGNORED) for s in states)
-
-        actions["VcUpdate"] = True
-        # TODO: We can't do this; this shells out for each selection change...
-        # actions["VcPush"] = bool(self.get_commits_to_push())
-        actions["VcPush"] = True
-
-        actions["VcAdd"] = all(s not in (
-            _vc.STATE_NORMAL, _vc.STATE_REMOVED) for s in states)
-        actions["VcResolved"] = all(s == _vc.STATE_CONFLICT for s in states)
-        actions["VcRemove"] = (all(s not in (
-            _vc.STATE_NONE, _vc.STATE_IGNORED,
-            _vc.STATE_REMOVED) for s in states) and
-            self.root not in path_states.keys())
-        actions["VcRevert"] = all(s not in (
-            _vc.STATE_NONE, _vc.STATE_NORMAL,
-            _vc.STATE_IGNORED) for s in states)
+        return os.path.exists(os.path.join(location, cls.VC_DIR))
 
     def get_commits_to_push_summary(self):
         branch_refs = self.get_commits_to_push()
@@ -115,27 +86,32 @@ class Vc(_vc.CachedVc):
         unpushed_commits = sum(len(v) for v in branch_refs.values())
         if unpushed_commits:
             if unpushed_branches > 1:
-                # Translators: First %s is replaced by translated "%d unpushed
-                # commits", second %s is replaced by translated "%d branches"
-                label = _("%s in %s") % (
-                    ngettext("%d unpushed commit", "%d unpushed commits",
-                             unpushed_commits) % unpushed_commits,
-                    ngettext("%d branch", "%d branches",
-                             unpushed_branches) % unpushed_branches)
+                # Translators: First element is replaced by translated "%d
+                # unpushed commits", second element is replaced by translated
+                # "%d branches"
+                label = _("{unpushed_commits} in {unpushed_branches}").format(
+                    unpushed_commits=ngettext(
+                        "%d unpushed commit", "%d unpushed commits",
+                        unpushed_commits) % unpushed_commits,
+                    unpushed_branches=ngettext(
+                        "%d branch", "%d branches",
+                        unpushed_branches) % unpushed_branches,
+                )
             else:
                 # Translators: These messages cover the case where there is
                 # only one branch, and are not part of another message.
-                label = ngettext("%d unpushed commit", "%d unpushed commits",
-                                 unpushed_commits) % (unpushed_commits)
+                label = ngettext(
+                    "%d unpushed commit", "%d unpushed commits",
+                    unpushed_commits) % (unpushed_commits)
         else:
             label = ""
         return label
 
     def get_commits_to_push(self):
-        proc = _vc.popen([self.CMD, "for-each-ref",
-                          "--format=%(refname:short) %(upstream:short)",
-                          "refs/heads"], cwd=self.location)
-        branch_remotes = proc.read().split("\n")[:-1]
+        proc = self.run(
+            "for-each-ref", "--format=%(refname:short) %(upstream:short)",
+            "refs/heads")
+        branch_remotes = proc.stdout.read().split("\n")[:-1]
 
         branch_revisions = {}
         for line in branch_remotes:
@@ -144,9 +120,8 @@ class Vc(_vc.CachedVc):
             except ValueError:
                 continue
 
-            proc = _vc.popen([self.CMD, "rev-list", branch, "^" + remote],
-                             cwd=self.location)
-            revisions = proc.read().split("\n")[:-1]
+            proc = self.run("rev-list", branch, "^" + remote, "--")
+            revisions = proc.stdout.read().split("\n")[:-1]
             branch_revisions[branch] = revisions
         return branch_revisions
 
@@ -154,32 +129,42 @@ class Vc(_vc.CachedVc):
         files = []
         for p in paths:
             if os.path.isdir(p):
-                entries = self._get_modified_files(p)
-                names = [self.diff_re.search(e).groups()[3] for e in entries]
+                cached_entries, entries = self._get_modified_files(p)
+                all_entries = set(entries + cached_entries)
+                names = [
+                    self.DIFF_RE.search(e).groups()[5] for e in all_entries
+                ]
                 files.extend(names)
             else:
                 files.append(os.path.relpath(p, self.root))
         return sorted(list(set(files)))
 
     def get_commit_message_prefill(self):
-        """This will be inserted into the commit dialog when commit is run"""
         commit_path = os.path.join(self.root, ".git", "MERGE_MSG")
         if os.path.exists(commit_path):
             # If I have to deal with non-ascii, non-UTF8 pregenerated commit
             # messages, I'm taking up pig farming.
-            with open(commit_path) as f:
-                message = f.read().decode('utf8')
+            with open(commit_path, encoding='utf-8') as f:
+                message = f.read()
             return "\n".join(
                 (l for l in message.splitlines() if not l.startswith("#")))
         return None
 
-    def update(self, runner, files):
+    def commit(self, runner, files, message):
+        command = [self.CMD, 'commit', '-m', message]
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    def update(self, runner):
         command = [self.CMD, 'pull']
         runner(command, [], refresh=True, working_dir=self.root)
 
     def push(self, runner):
         command = [self.CMD, 'push']
         runner(command, [], refresh=True, working_dir=self.root)
+
+    def add(self, runner, files):
+        command = [self.CMD, 'add']
+        runner(command, files, refresh=True, working_dir=self.root)
 
     def remove(self, runner, files):
         command = [self.CMD, 'rm', '-r']
@@ -195,31 +180,66 @@ class Vc(_vc.CachedVc):
             command = [self.CMD, 'checkout', 'HEAD']
             runner(command, missing, refresh=True, working_dir=self.root)
 
+    def resolve(self, runner, files):
+        command = [self.CMD, 'add']
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    def remerge_with_ancestor(self, local, base, remote, suffix=''):
+        """Reconstruct a mixed merge-plus-base file
+
+        This method re-merges a given file to get diff3-style conflicts
+        which we can then use to get a file that contains the
+        pre-merged result everywhere that has no conflict, and the
+        common ancestor anywhere there *is* a conflict.
+        """
+        proc = self.run(
+            "merge-file", "-p", "--diff3", local, base, remote,
+            use_locale_encoding=False)
+        vc_file = io.BytesIO(
+            _vc.base_from_diff3(proc.stdout.read()))
+
+        prefix = 'meld-tmp-%s-' % _vc.CONFLICT_MERGED
+        with tempfile.NamedTemporaryFile(
+                prefix=prefix, suffix=suffix, delete=False) as f:
+            shutil.copyfileobj(vc_file, f)
+
+        return f.name, True
+
     def get_path_for_conflict(self, path, conflict):
         if not path.startswith(self.root + os.path.sep):
             raise _vc.InvalidVCPath(self, path, "Path not in repository")
 
         if conflict == _vc.CONFLICT_MERGED:
             # Special case: no way to get merged result from git directly
-            return path, False
+            local, _ = self.get_path_for_conflict(path, _vc.CONFLICT_LOCAL)
+            base, _ = self.get_path_for_conflict(path, _vc.CONFLICT_BASE)
+            remote, _ = self.get_path_for_conflict(path, _vc.CONFLICT_REMOTE)
+
+            if not (local and base and remote):
+                raise _vc.InvalidVCPath(self, path,
+                                        "Couldn't access conflict parents")
+
+            suffix = os.path.splitext(path)[1]
+            filename, is_temp = self.remerge_with_ancestor(
+                local, base, remote, suffix=suffix)
+
+            for temp_file in (local, base, remote):
+                if os.name == "nt":
+                    os.chmod(temp_file, stat.S_IWRITE)
+                os.remove(temp_file)
+
+            return filename, is_temp
 
         path = path[len(self.root) + 1:]
         if os.name == "nt":
             path = path.replace("\\", "/")
 
+        suffix = os.path.splitext(path)[1]
         args = ["git", "show", ":%s:%s" % (self.conflict_map[conflict], path)]
-        process = subprocess.Popen(args,
-                                   cwd=self.location, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-        vc_file = process.stdout
-
-        # Error handling here involves doing nothing; in most cases, the only
-        # sane response is to return an empty temp file.
-
-        prefix = 'meld-tmp-%s-' % _vc.conflicts[conflict]
-        with tempfile.NamedTemporaryFile(prefix=prefix, delete=False) as f:
-            shutil.copyfileobj(vc_file, f)
-        return f.name, True
+        filename = _vc.call_temp_output(
+            args, cwd=self.location,
+            file_id=_vc.conflicts[conflict], suffix=suffix)
+        return filename, True
 
     def get_path_for_repo_file(self, path, commit=None):
         if commit is None:
@@ -234,141 +254,109 @@ class Vc(_vc.CachedVc):
             path = path.replace("\\", "/")
 
         obj = commit + ":" + path
-        process = subprocess.Popen([self.CMD, "cat-file", "blob", obj],
-                                   cwd=self.root, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-        vc_file = process.stdout
+        suffix = os.path.splitext(path)[1]
+        args = [self.CMD, "cat-file", "blob", obj]
+        return _vc.call_temp_output(args, cwd=self.root, suffix=suffix)
 
-        # Error handling here involves doing nothing; in most cases, the only
-        # sane response is to return an empty temp file.
-
-        with tempfile.NamedTemporaryFile(prefix='meld-tmp', delete=False) as f:
-            shutil.copyfileobj(vc_file, f)
-        return f.name
-
-    def valid_repo(self):
+    @classmethod
+    def valid_repo(cls, path):
         # TODO: On Windows, this exit code is wrong under the normal shell; it
         # appears to be correct under the default git bash shell however.
-        if _vc.call([self.CMD, "branch"], cwd=self.root):
-            return False
-        else:
-            return True
-
-    def get_working_directory(self, workdir):
-        if workdir.startswith("/"):
-            return self.root
-        else:
-            return ''
+        return not _vc.call([cls.CMD, "branch"], cwd=path)
 
     def _get_modified_files(self, path):
-        # Update the index before getting status, otherwise we could
-        # be reading stale status information
-        _vc.popen([self.CMD, "update-index", "--refresh"],
-                  cwd=self.location)
+        # Update the index to avoid reading stale status information
+        proc = self.run("update-index", "--refresh")
 
-        # Get the status of files that are different in the "index" vs
-        # the HEAD of the git repository
-        proc = _vc.popen([self.CMD, "diff-index",
-                          "--cached", "HEAD", path], cwd=self.location)
-        entries = proc.read().split("\n")[:-1]
+        # Get status differences between the index and the repo HEAD
+        proc = self.run("diff-index", "--cached", "HEAD", "--relative", path)
+        cached_entries = proc.stdout.read().split("\n")[:-1]
 
-        # Get the status of files that are different in the "index" vs
-        # the files on disk
-        proc = _vc.popen([self.CMD, "diff-files",
-                          "-0", path], cwd=self.location)
-        entries += (proc.read().split("\n")[:-1])
+        # Get status differences between the index and files-on-disk
+        proc = self.run("diff-files", "-0", "--relative", path)
+        entries = proc.stdout.read().split("\n")[:-1]
 
-        # An unmerged file or a file that has been modified, added to
-        # git's index, then modified again would result in the file
-        # showing up in both the output of "diff-files" and
-        # "diff-index".  The following command removes duplicate
-        # file entries.
-        entries = list(set(entries))
+        # Files can show up in both lists, e.g., if a file is modified,
+        # added to the index and changed again. This is okay, and in
+        # fact the calling logic requires it for staging feedback.
+        return cached_entries, entries
 
-        return entries
-
-    def _update_tree_state_cache(self, path, tree_state):
-        """ Update the state of the file(s) at tree_state['path'] """
+    def _update_tree_state_cache(self, path):
+        """ Update the state of the file(s) at self._tree_cache['path'] """
         while 1:
             try:
-                entries = self._get_modified_files(path)
+                cached_entries, entries = self._get_modified_files(path)
 
-                # Identify ignored files
-                proc = _vc.popen([self.CMD, "ls-files", "--others",
-                                  "--ignored", "--exclude-standard", path],
-                                 cwd=self.location)
-                ignored_entries = proc.read().split("\n")[:-1]
+                # Identify ignored files and folders
+                proc = self.run(
+                    "ls-files", "--others", "--ignored", "--exclude-standard",
+                    "--directory", path)
+                ignored_entries = proc.stdout.read().split("\n")[:-1]
 
                 # Identify unversioned files
-                proc = _vc.popen([self.CMD, "ls-files", "--others",
-                                  "--exclude-standard", path],
-                                 cwd=self.location)
-                unversioned_entries = proc.read().split("\n")[:-1]
+                proc = self.run(
+                    "ls-files", "--others", "--exclude-standard", path)
+                unversioned_entries = proc.stdout.read().split("\n")[:-1]
 
                 break
             except OSError as e:
                 if e.errno != errno.EAGAIN:
                     raise
 
-        if len(entries) == 0 and os.path.isfile(path):
+        def get_real_path(name):
+            name = name.strip()
+            if os.name == 'nt':
+                # Git returns unix-style paths on Windows
+                name = os.path.normpath(name)
+
+            # Unicode file names and file names containing quotes are
+            # returned by git as quoted strings
+            if name[0] == '"':
+                name = name.encode('latin1')
+                name = codecs.escape_decode(name[1:-1])[0].decode('utf-8')
+            return os.path.abspath(
+                os.path.join(self.location, name))
+
+        if not cached_entries and not entries and os.path.isfile(path):
             # If we're just updating a single file there's a chance that it
-            # was it was previously modified, and now has been edited
-            # so that it is un-modified.  This will result in an empty
-            # 'entries' list, and tree_state['path'] will still contain stale
-            # data.  When this corner case occurs we force tree_state['path']
+            # was it was previously modified, and now has been edited so that
+            # it is un-modified.  This will result in an empty 'entries' list,
+            # and self._tree_cache['path'] will still contain stale data.
+            # When this corner case occurs we force self._tree_cache['path']
             # to STATE_NORMAL.
-            tree_state[path] = _vc.STATE_NORMAL
+            self._tree_cache[get_real_path(path)] = _vc.STATE_NORMAL
         else:
-            # There are 1 or more modified files, parse their state
-            for entry in entries:
-                columns = self.diff_re.search(entry).groups()
-                old_mode, new_mode, statekey, name = columns
-                if os.name == 'nt':
-                    # Git returns unix-style paths on Windows
-                    name = os.path.normpath(name.strip())
-                path = os.path.join(self.root, name.strip())
+            tree_meta_cache = defaultdict(list)
+            staged = set()
+            unstaged = set()
+
+            # We iterate over both cached entries and entries, accumulating
+            # metadata from both, but using the state from entries.
+            for entry in cached_entries + entries:
+                columns = self.DIFF_RE.search(entry).groups()
+                old_mode, new_mode, old_sha, new_sha, statekey, path = columns
                 state = self.state_map.get(statekey.strip(), _vc.STATE_NONE)
-                tree_state[path] = state
+                path = get_real_path(path)
+                self._tree_cache[path] = state
+                # Git entries can't be MISSING; that's just an unstaged REMOVED
+                self._add_missing_cache_entry(path, state)
                 if old_mode != new_mode:
-                    msg = _("Mode changed from %s to %s" %
-                            (old_mode, new_mode))
-                    self._tree_meta_cache[path] = msg
+                    msg = _(
+                        "Mode changed from {old_mode} to {new_mode}".format(
+                            old_mode=old_mode, new_mode=new_mode))
+                    tree_meta_cache[path].append(msg)
+                collection = unstaged if new_sha == NULL_SHA else staged
+                collection.add(path)
 
-            for entry in ignored_entries:
-                path = os.path.join(self.location, entry.strip())
-                tree_state[path] = _vc.STATE_IGNORED
+            for path in staged:
+                tree_meta_cache[path].append(
+                    _("Partially staged") if path in unstaged else _("Staged"))
 
-            for entry in unversioned_entries:
-                path = os.path.join(self.location, entry.strip())
-                tree_state[path] = _vc.STATE_NONE
+            for path, msgs in tree_meta_cache.items():
+                self._tree_meta_cache[path] = "; ".join(msgs)
 
-    def _lookup_tree_cache(self, rootdir):
-        # Get a list of all files in rootdir, as well as their status
-        tree_state = {}
-        self._update_tree_state_cache("./", tree_state)
-        return tree_state
+            for path in ignored_entries:
+                self._tree_cache[get_real_path(path)] = _vc.STATE_IGNORED
 
-    def update_file_state(self, path):
-        tree_state = self._get_tree_cache(os.path.dirname(path))
-        self._update_tree_state_cache(path, tree_state)
-
-    def _get_dirsandfiles(self, directory, dirs, files):
-
-        tree = self._get_tree_cache(directory)
-
-        retfiles = []
-        retdirs = []
-        for name, path in files:
-            state = tree.get(path, _vc.STATE_NORMAL)
-            meta = self._tree_meta_cache.get(path, "")
-            retfiles.append(_vc.File(path, name, state, options=meta))
-        for name, path in dirs:
-            # git does not operate on dirs, just files
-            retdirs.append(_vc.Dir(path, name, _vc.STATE_NORMAL))
-        for path, state in tree.items():
-            # removed files are not in the filesystem, so must be added here
-            if state in (_vc.STATE_REMOVED, _vc.STATE_MISSING):
-                folder, name = os.path.split(path)
-                if folder == directory:
-                    retfiles.append(_vc.File(path, name, state))
-        return retdirs, retfiles
+            for path in unversioned_entries:
+                self._tree_cache[get_real_path(path)] = _vc.STATE_NONE

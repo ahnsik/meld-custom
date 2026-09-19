@@ -1,50 +1,54 @@
-### Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
-### Copyright (C) 2009-2011 Kai Willadsen <kai.willadsen@gmail.com>
+# Copyright (C) 2002-2006 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2009-2013 Kai Willadsen <kai.willadsen@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-### This program is free software; you can redistribute it and/or modify
-### it under the terms of the GNU General Public License as published by
-### the Free Software Foundation; either version 2 of the License, or
-### (at your option) any later version.
+import logging
+from typing import Any, List, Optional
 
-### This program is distributed in the hope that it will be useful,
-### but WITHOUT ANY WARRANTY; without even the implied warranty of
-### MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-### GNU General Public License for more details.
+from gi.repository import Gio, GLib, GObject, GtkSource
 
-### You should have received a copy of the GNU General Public License
-### along with this program; if not, write to the Free Software
-### Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
-### USA.
+from meld.conf import _
+from meld.settings import bind_settings
 
-from __future__ import unicode_literals
-
-import sys
-from gettext import gettext as _
-
-from .util import sourceviewer
-
-from .util.compat import text_type
+log = logging.getLogger(__name__)
 
 
-class MeldBuffer(sourceviewer.srcviewer.GtkTextBuffer):
+class MeldBuffer(GtkSource.Buffer):
 
     __gtype_name__ = "MeldBuffer"
 
-    def __init__(self, filename=None):
-        sourceviewer.srcviewer.GtkTextBuffer.__init__(self)
-        self.data = MeldBufferData(filename)
+    __gsettings_bindings__ = (
+        ('highlight-syntax', 'highlight-syntax'),
+    )
 
-    def reset_buffer(self, filename):
-        """Clear the contents of the buffer and reset its metadata"""
-        self.delete(*self.get_bounds())
+    def __init__(self):
+        super().__init__()
+        bind_settings(self)
+        self.data = MeldBufferData()
+        self.undo_sequence = None
 
-        new_data = MeldBufferData(filename)
-        if self.data.filename == filename:
-            new_data.label = self.data.label
-        self.data = new_data
+    def do_begin_user_action(self, *args):
+        if self.undo_sequence:
+            self.undo_sequence.begin_group()
+
+    def do_end_user_action(self, *args):
+        if self.undo_sequence:
+            self.undo_sequence.end_group()
 
     def get_iter_at_line_or_eof(self, line):
-        """Return a gtk.TextIter at the given line, or the end of the buffer.
+        """Return a Gtk.TextIter at the given line, or the end of the buffer.
 
         This method is like get_iter_at_line, but if asked for a position past
         the end of the buffer, this returns the end of the buffer; the
@@ -60,7 +64,7 @@ class MeldBuffer(sourceviewer.srcviewer.GtkTextBuffer):
 
         This method is like insert, but if asked to insert something past the
         last line in the buffer, this will insert at the end, and will add a
-        linebreak before the inserted text. The last line in a gtk.TextBuffer
+        linebreak before the inserted text. The last line in a Gtk.TextBuffer
         is guaranteed never to have a newline, so we need to handle this.
         """
         if line >= self.get_line_count():
@@ -72,106 +76,228 @@ class MeldBuffer(sourceviewer.srcviewer.GtkTextBuffer):
         return it
 
 
-class MeldBufferData(object):
+class MeldBufferData(GObject.GObject):
 
-    def __init__(self, filename=None):
-        self.modified = False
-        self.writable = True
-        self.editable = True
-        self.filename = filename
+    @GObject.Signal('file-changed')
+    def file_changed_signal(self) -> None:
+        ...
+
+    encoding = GObject.Property(
+        type=GtkSource.Encoding,
+        nick="The file encoding of the linked GtkSourceFile",
+        default=GtkSource.Encoding.get_utf8(),
+    )
+
+    def __init__(self):
+        super().__init__()
+        self._gfile = None
+        self._label = None
+        self._monitor = None
+        self._sourcefile = None
+        self.reset(gfile=None)
+
+    def reset(self, gfile):
+        same_file = gfile and self._gfile and gfile.equal(self._gfile)
+        self.gfile = gfile
+        if same_file:
+            self.label = self._label
+        else:
+            self.label = gfile.get_parse_name() if gfile else None
+        self.loaded = False
         self.savefile = None
-        self._label = filename
-        self.encoding = None
-        self.newlines = None
 
-    def get_label(self):
-        #TRANSLATORS: This is the label of a new, currently-unnamed file.
+    def __del__(self):
+        self.disconnect_monitor()
+
+    @property
+    def label(self):
+        # TRANSLATORS: This is the label of a new, currently-unnamed file.
         return self._label or _("<unnamed>")
 
-    def set_label(self, value):
+    @label.setter
+    def label(self, value):
+        if not value:
+            return
+        if not isinstance(value, str):
+            log.warning('Invalid label ignored "%r"', value)
+            return
         self._label = value
 
-    label = property(get_label, set_label)
+    def connect_monitor(self):
+        if not self._gfile:
+            return
+        monitor = self._gfile.monitor_file(Gio.FileMonitorFlags.NONE, None)
+        handler_id = monitor.connect('changed', self._handle_file_change)
+        self._monitor = monitor, handler_id
+
+    def disconnect_monitor(self):
+        if not self._monitor:
+            return
+        monitor, handler_id = self._monitor
+        monitor.disconnect(handler_id)
+        monitor.cancel()
+        self._monitor = None
+
+    def _query_mtime(self, gfile):
+        try:
+            time_query = ",".join((Gio.FILE_ATTRIBUTE_TIME_MODIFIED,
+                                   Gio.FILE_ATTRIBUTE_TIME_MODIFIED_USEC))
+            info = gfile.query_info(time_query, 0, None)
+        except GLib.GError:
+            return None
+        mtime = info.get_modification_time()
+        return (mtime.tv_sec, mtime.tv_usec)
+
+    def _handle_file_change(self, monitor, f, other_file, event_type):
+        mtime = self._query_mtime(f)
+        if self._disk_mtime and mtime and mtime > self._disk_mtime:
+            self.file_changed_signal.emit()
+        self._disk_mtime = mtime or self._disk_mtime
+
+    @property
+    def gfile(self):
+        return self._gfile
+
+    @gfile.setter
+    def gfile(self, value):
+        self.disconnect_monitor()
+        self._gfile = value
+        self._sourcefile = GtkSource.File()
+        self._sourcefile.set_location(value)
+        self._sourcefile.bind_property(
+            'encoding', self, 'encoding', GObject.BindingFlags.DEFAULT)
+
+        self.update_mtime()
+        self.connect_monitor()
+
+    @property
+    def sourcefile(self):
+        return self._sourcefile
+
+    @property
+    def gfiletarget(self):
+        return self.savefile or self.gfile
+
+    @property
+    def is_special(self):
+        try:
+            info = self._gfile.query_info(
+                Gio.FILE_ATTRIBUTE_STANDARD_TYPE, 0, None)
+            return info.get_file_type() == Gio.FileType.SPECIAL
+        except (AttributeError, GLib.GError):
+            return False
+
+    @property
+    def writable(self):
+        try:
+            info = self.gfiletarget.query_info(
+                Gio.FILE_ATTRIBUTE_ACCESS_CAN_WRITE, 0, None)
+        except GLib.GError as err:
+            if err.code == Gio.IOErrorEnum.NOT_FOUND:
+                return True
+            return False
+        except AttributeError:
+            return False
+        return info.get_attribute_boolean(Gio.FILE_ATTRIBUTE_ACCESS_CAN_WRITE)
+
+    def update_mtime(self):
+        if self._gfile:
+            self._disk_mtime = self._query_mtime(self._gfile)
+            self._mtime = self._disk_mtime
+
+    def current_on_disk(self):
+        return self._mtime == self._disk_mtime
 
 
-class BufferLines(object):
-    """gtk.TextBuffer shim with line-based access and optional filtering
+class BufferLines:
+    """Gtk.TextBuffer shim with line-based access and optional filtering
 
-    This class allows a gtk.TextBuffer to be treated as a list of lines of
+    This class allows a Gtk.TextBuffer to be treated as a list of lines of
     possibly-filtered text. If no filter is given, the raw output from the
-    gtk.TextBuffer is used.
-
-    The logic here (and in places in FileDiff) requires that Python's
-    unicode splitlines() implementation and gtk.TextBuffer agree on where
-    linebreaks occur. Happily, this is usually the case.
+    Gtk.TextBuffer is used.
     """
 
-    def __init__(self, buf, textfilter=None):
+    #: Cached copy of the (possibly filtered) text in a single line,
+    #: where an entry of None indicates that there is no cached result
+    #: available.
+    lines: List[Optional[str]]
+
+    def __init__(self, buf, textfilter=None, *, cache_debug: bool = False):
         self.buf = buf
         if textfilter is not None:
             self.textfilter = textfilter
         else:
-            self.textfilter = lambda x: x
+            self.textfilter = lambda x, buf, start_iter, end_iter: x
+
+        self.lines = [None] * self.buf.get_line_count()
+        self.mark = buf.create_mark(
+            "bufferlines-insert", buf.get_start_iter(), True,
+        )
+
+        buf.connect("insert-text", self.on_insert_text),
+        buf.connect("delete-range", self.on_delete_range),
+        buf.connect_after("insert-text", self.after_insert_text),
+        if cache_debug:
+            buf.connect_after("insert-text", self._check_cache_invariant)
+            buf.connect_after("delete-range", self._check_cache_invariant)
+
+    def _check_cache_invariant(self, *args: Any) -> None:
+        if len(self.lines) != len(self):
+            log.error(
+                "Cache line count does not match buffer line count: "
+                f"{len(self.lines)} != {len(self)}",
+            )
+
+    def clear_cache(self) -> None:
+        self.lines = [None] * self.buf.get_line_count()
+
+    def on_insert_text(self, buf, it, text, textlen):
+        buf.move_mark(self.mark, it)
+
+    def after_insert_text(self, buf, it, newtext, textlen):
+        start_idx = buf.get_iter_at_mark(self.mark).get_line()
+        end_idx = it.get_line() + 1
+        # Replace the insertion-point cache line with a list of empty
+        # lines. In the single-line case this will be a single element
+        # substitution; for multi-line inserts, we will replace the
+        # single insertion point line with several empty cache lines.
+        self.lines[start_idx:start_idx + 1] = [None] * (end_idx - start_idx)
+
+    def on_delete_range(self, buf, it0, it1):
+        start_idx = it0.get_line()
+        end_idx = it1.get_line() + 1
+        self.lines[start_idx:end_idx] = [None]
 
     def __getitem__(self, key):
         if isinstance(key, slice):
             lo, hi, _ = key.indices(self.buf.get_line_count())
 
-            # FIXME: If we ask for arbitrary slices past the end of the buffer,
-            # this will return the last line.
-            start = self.buf.get_iter_at_line_or_eof(lo)
-            end = self.buf.get_iter_at_line_or_eof(hi)
-            txt = text_type(self.buf.get_text(start, end, False), 'utf8')
+            for idx in range(lo, hi):
+                if self.lines[idx] is None:
+                    self.lines[idx] = self[idx]
 
-            filter_txt = self.textfilter(txt)
-            lines = filter_txt.splitlines()
-            ends = filter_txt.splitlines(True)
-
-            # The last line in a gtk.TextBuffer is guaranteed never to end in a
-            # newline. As splitlines() discards an empty line at the end, we
-            # need to artificially add a line if the requested slice is past
-            # the end of the buffer, and the last line in the slice ended in a
-            # newline.
-            if hi >= self.buf.get_line_count() and \
-               lo < self.buf.get_line_count() and \
-               (len(lines) == 0 or len(lines[-1]) != len(ends[-1])):
-                lines.append("")
-                ends.append("")
-
-            hi = self.buf.get_line_count() if hi == sys.maxsize else hi
-            if hi - lo != len(lines):
-                # These codepoints are considered line breaks by Python, but
-                # not by GtkTextStore.
-                additional_breaks = set(('\x0c', '\x85'))
-                i = 0
-                while i < len(ends):
-                    line, end = lines[i], ends[i]
-                    # It's possible that the last line in a file would end in a
-                    # line break character, which requires no joining.
-                    if end and end[-1] in additional_breaks and \
-                       (not line or line[-1] not in additional_breaks):
-                        assert len(ends) >= i + 1
-                        lines[i:i + 2] = [line + end[-1] + lines[i + 1]]
-                        ends[i:i + 2] = [end + ends[i + 1]]
-                    i += 1
-
-            return lines
+            return self.lines[lo:hi]
 
         elif isinstance(key, int):
             if key >= len(self):
                 raise IndexError
-            line_start = self.buf.get_iter_at_line_or_eof(key)
-            line_end = line_start.copy()
-            if not line_end.ends_line():
-                line_end.forward_to_line_end()
-            txt = self.buf.get_text(line_start, line_end, False)
-            return text_type(self.textfilter(txt), 'utf8')
+
+            if self.lines[key] is None:
+                line_start = self.buf.get_iter_at_line_or_eof(key)
+                line_end = line_start.copy()
+                if not line_end.ends_line():
+                    line_end.forward_to_line_end()
+                txt = self.buf.get_text(line_start, line_end, False)
+                txt = self.textfilter(txt, self.buf, line_start, line_end)
+                self.lines[key] = txt
+
+            return self.lines[key]
 
     def __len__(self):
         return self.buf.get_line_count()
 
 
-class BufferAction(object):
+class BufferAction:
     """A helper to undo/redo text insertion/deletion into/from a text buffer"""
 
     def __init__(self, buf, offset, text):
@@ -183,10 +309,14 @@ class BufferAction(object):
         start = self.buffer.get_iter_at_offset(self.offset)
         end = self.buffer.get_iter_at_offset(self.offset + len(self.text))
         self.buffer.delete(start, end)
+        self.buffer.place_cursor(end)
+        return [self]
 
     def insert(self):
         start = self.buffer.get_iter_at_offset(self.offset)
+        self.buffer.place_cursor(start)
         self.buffer.insert(start, self.text)
+        return [self]
 
 
 class BufferInsertionAction(BufferAction):

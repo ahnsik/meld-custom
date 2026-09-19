@@ -1,82 +1,91 @@
-# -*- coding: utf-8 -*- 
+# Copyright (C) 2010-2015 Kai Willadsen <kai.willadsen@gmail.com>
+# Copyright (C)      2016 Guillaume Hoffmann <guillaumh@gmail.com>
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+#
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
 
-# vim:set shiftwidth=4 tabstop=4 expandtab textwidth=79:
-#Copyright (c) 2005 Ali Afshar <aafshar@gmail.com>
-
-#Permission is hereby granted, free of charge, to any person obtaining a copy
-#of this software and associated documentation files (the "Software"), to deal
-#in the Software without restriction, including without limitation the rights
-#to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-#copies of the Software, and to permit persons to whom the Software is
-#furnished to do so, subject to the following conditions:
-
-#The above copyright notice and this permission notice shall be included in
-#all copies or substantial portions of the Software.
-
-#THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-#IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-#FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-#AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-#LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-#OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-#SOFTWARE.
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
+# IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+# OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
+# IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
+# INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+# NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+# THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import errno
 import os
 import shutil
 import subprocess
 import tempfile
+from collections import defaultdict
 
 from . import _vc
 
 
-class Vc(_vc.CachedVc):
+class Vc(_vc.Vc):
+
+    # Requires Darcs version >= 2.10.3
+    # TODO implement get_commits_to_push_summary using `darcs push --dry-run`
+    # Currently `darcs whatsnew` (as of v2.10.3) does not report conflicts
+    # see http://bugs.darcs.net/issue2138
 
     CMD = "darcs"
     NAME = "Darcs"
     VC_DIR = "_darcs"
+
     state_map = {
         "a": _vc.STATE_NONE,
         "A": _vc.STATE_NEW,
         "M": _vc.STATE_MODIFIED,
-        "C": _vc.STATE_CONFLICT,
+        "M!": _vc.STATE_CONFLICT,
         "R": _vc.STATE_REMOVED,
+        "F": _vc.STATE_NONEXIST,  # previous name of file
+        "T": _vc.STATE_RENAMED,   # new name of file
     }
 
-    def commit_command(self, message):
-        return [self.CMD, "record",
-                "--skip-long-comment",
-                "--repodir=%s" % self.root,
-                "-a",
-                "-m", message]
-
-    def update_command(self):
-        # This will not work while passing the files parameter after it
-        # This hack allows you to update in the root directory
-        return [self.CMD, "pull", "-a", "-p"]
-
-    def add_command(self):
-        return [self.CMD, "add"]
-
-    def remove_command(self, force=0):
-        return [self.CMD, "remove"]
- 
-    def revert_command(self):
-        # will not work, since darcs needs interaction it seems
-        return [self.CMD, "revert", "-a"]
-
-    def resolved_command(self):
-        # untested
-        return [self.CMD, "resolve"]
-
-    def valid_repo(self):
-        if _vc.call([self.CMD, "query", "tags"], cwd=self.root):
-            return False
-        else:
+    @classmethod
+    def is_installed(cls):
+        try:
+            proc = _vc.popen([cls.CMD, '--version'])
+            # check that version >= 2.10.3
+            (x, y, z) = proc.read().split(" ", 1)[0].split(".", 2)[:3]
+            assert (x, y, z) >= (2, 10, 3)
             return True
+        except Exception:
+            return False
 
-    def get_working_directory(self, workdir):
-        return self.root
+    def commit(self, runner, files, message):
+        command = [self.CMD, 'record', '-a', '-m', message]
+        runner(command, [], refresh=True, working_dir=self.root)
+
+    def update(self, runner):
+        command = [self.CMD, 'pull', '-a']
+        runner(command, [], refresh=True, working_dir=self.root)
+
+    def push(self, runner):
+        command = [self.CMD, 'push', '-a']
+        runner(command, [], refresh=True, working_dir=self.root)
+
+    def add(self, runner, files):
+        command = [self.CMD, 'add', '-r']
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    def remove(self, runner, files):
+        command = [self.CMD, 'remove', '-r']
+        runner(command, files, refresh=True, working_dir=self.root)
+
+    def revert(self, runner, files):
+        command = [self.CMD, 'revert', '-a']
+        runner(command, files, refresh=True, working_dir=self.root)
 
     def get_path_for_repo_file(self, path, commit=None):
         if commit is not None:
@@ -84,70 +93,82 @@ class Vc(_vc.CachedVc):
 
         if not path.startswith(self.root + os.path.sep):
             raise _vc.InvalidVCPath(self, path, "Path not in repository")
+
+        # `darcs show contents` needs the path before rename
+        if path in self._reverse_rename_cache:
+            path = self._reverse_rename_cache[path]
+
         path = path[len(self.root) + 1:]
+        suffix = os.path.splitext(path)[1]
+        process = subprocess.Popen(
+            [self.CMD, "show", "contents", path], cwd=self.root,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        process = subprocess.Popen([self.CMD, "show", "contents",
-                                    "--repodir=" + self.root, path],
-                                   cwd=self.root, stdout=subprocess.PIPE,
-                                   stderr=subprocess.PIPE)
-        vc_file = process.stdout
-
-        # Error handling here involves doing nothing; in most cases, the only
-        # sane response is to return an empty temp file.
-
-        with tempfile.NamedTemporaryFile(prefix='meld-tmp', delete=False) as f:
-            shutil.copyfileobj(vc_file, f)
+        with tempfile.NamedTemporaryFile(prefix='meld-tmp',
+                                         suffix=suffix, delete=False) as f:
+            shutil.copyfileobj(process.stdout, f)
         return f.name
 
-    def _get_dirsandfiles(self, directory, dirs, files):
-        whatsnew = self._get_tree_cache(directory)
-        retfiles, retdirs = (self._get_statuses(whatsnew, files, _vc.File),
-                             self._get_statuses(whatsnew, dirs, _vc.Dir))
-        return retfiles, retdirs
+    @classmethod
+    def valid_repo(cls, path):
+        return not _vc.call([cls.CMD, "show", "repo", "--no-files"], cwd=path)
 
-    def _lookup_tree_cache(self, rootdir):
-        non_boring = self._get_whatsnew()
-        boring = self._get_whatsnew(boring=True)
-        for path in boring:
-            if not path in non_boring:
-                non_boring[path] = _vc.STATE_IGNORED
-        return non_boring
-
-    def _get_whatsnew(self, boring=False):
-        whatsnew = {}
-        commandline = [self.CMD, "whatsnew", "--summary", "-l", "--repodir=" + self.root]
-        if boring:
-            commandline.append("--boring")
+    def _update_tree_state_cache(self, path):
+        # FIXME: currently ignoring 'path' due to darcs's bad
+        #        behaviour (= fails) when given "" argument
+        """ Update the state of the file(s) at self._tree_cache['path'] """
         while 1:
             try:
-                p = _vc.popen(commandline)
+                proc = _vc.popen(
+                    [self.CMD, "whatsnew", "-sl", "--machine-readable"],
+                    cwd=self.location)
+                lines = proc.read().split("\n")[:-1]
                 break
             except OSError as e:
                 if e.errno != errno.EAGAIN:
                     raise
-        for line in p:
-            if line.startswith('No changes!'):
-                continue
-            elements = line.split()
-            if len(elements) > 1:
-                if elements[1] == '->':
-                    status = _vc.STATE_NEW
-                    filename = elements.pop()
-                else:
-                    status = self.state_map[elements.pop(0)]
-                    filename = elements.pop(0)
-                filepath = os.path.join(self.root,
-                                        os.path.normpath(filename))
-                whatsnew[filepath] = status
-        return whatsnew
 
-    def _get_statuses(self, whatsnew, files, fstype):
-        rets = []
-        for filename, path in files:
-            state = _vc.STATE_NORMAL
-            if path in whatsnew:
-                state = whatsnew[path]
-            vcfile = fstype(path, filename, state)
-            if filename != self.VC_DIR:
-                rets.append(vcfile)
-        return rets
+        # Files can appear twice in the list if were modified and renamed
+        # at once. Darcs first show file moves then modifications.
+        if len(lines) == 0 and os.path.isfile(path):
+            # If we're just updating a single file there's a chance that it
+            # was it was previously modified, and now has been edited so that
+            # it is un-modified.  This will result in an empty 'entries' list,
+            # and self._tree_cache['path'] will still contain stale data.
+            # When this corner case occurs we force self._tree_cache['path']
+            # to STATE_NORMAL.
+            self._tree_cache[path] = _vc.STATE_NORMAL
+        else:
+            tree_cache = defaultdict(int)
+            tree_meta_cache = defaultdict(list)
+            self._rename_cache = rename_cache = {}
+            self._reverse_rename_cache = {}
+            old_name = None
+            for line in lines:
+                # skip empty lines and line starting with "What's new in foo"
+                if (not line.strip()) or line.startswith("What"):
+                    continue
+                statekey, name = line.split(" ", 1)
+                name = os.path.normpath(name)
+                if statekey == "F":
+                    old_name = name
+
+                path = os.path.join(self.location, name)
+
+                if statekey == "T" and old_name:
+                    old_path = os.path.join(self.location, old_name)
+                    rename_cache[old_path] = path
+                    old_name = None
+
+                state = self.state_map.get(statekey.strip(), _vc.STATE_NONE)
+                tree_cache[path] = state
+
+            for old, new in rename_cache.items():
+                self._reverse_rename_cache[new] = old
+                old_name = old[len(self.root) + 1:]
+                new_name = new[len(self.root) + 1:]
+                tree_meta_cache[new] = ("%s ➡ %s" % (old_name, new_name))
+
+            self._tree_cache.update(
+                dict((x, y) for x, y in tree_cache.items()))
+            self._tree_meta_cache = dict(tree_meta_cache)

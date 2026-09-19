@@ -1,435 +1,380 @@
-### Copyright (C) 2002-2009 Stephen Kennedy <stevek@gnome.org>
-### Copyright (C) 2010-2011 Kai Willadsen <kai.willadsen@gmail.com>
+# Copyright (C) 2002-2009 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2010-2013 Kai Willadsen <kai.willadsen@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-### This program is free software; you can redistribute it and/or modify
-### it under the terms of the GNU General Public License as published by
-### the Free Software Foundation; either version 2 of the License, or
-### (at your option) any later version.
+from gi.repository import Gio, GLib, GObject, Gtk, GtkSource
 
-### This program is distributed in the hope that it will be useful,
-### but WITHOUT ANY WARRANTY; without even the implied warranty of
-### MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-### GNU General Public License for more details.
-
-### You should have received a copy of the GNU General Public License
-### along with this program; if not, write to the Free Software
-### Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
-### USA.
-
-import logging
-import shlex
-import string
-
-from gettext import gettext as _
-
-import gtk
-
-from . import filters
-from . import misc
-from . import paths
-from . import vc
-from .ui import gnomeglade
-from .ui import listwidget
-from .util import prefs
-
-from .util.sourceviewer import srcviewer
+from meld.conf import _
+from meld.filters import FilterEntry
+from meld.settings import settings
+from meld.ui.listwidget import EditableListWidget
 
 
-TIMESTAMP_RESOLUTION_PRESETS = [('1ns (ext4)', 1),
-                                ('100ns (NTFS)', 100),
-                                ('1s (ext2/ext3)', 1000000000),
-                                ('2s (VFAT)', 2000000000)]
+@Gtk.Template(resource_path='/org/gnome/meld/ui/filter-list.ui')
+class FilterList(Gtk.Box, EditableListWidget):
 
-log = logging.getLogger(__name__)
+    __gtype_name__ = "FilterList"
 
+    treeview = Gtk.Template.Child()
+    remove = Gtk.Template.Child()
+    move_up = Gtk.Template.Child()
+    move_down = Gtk.Template.Child()
+    pattern_column = Gtk.Template.Child()
+    validity_renderer = Gtk.Template.Child()
 
-class FilterList(listwidget.ListWidget):
+    default_entry = [_("label"), False, _("pattern"), True]
 
-    def __init__(self, prefs, key, filter_type):
-        default_entry = [_("label"), False, _("pattern"), True]
-        listwidget.ListWidget.__init__(self, "EditableList.ui",
-                                       "list_alignment", ["EditableListStore"],
-                                       "EditableList", default_entry)
-        self.prefs = prefs
-        self.key = key
-        self.filter_type = filter_type
+    filter_type = GObject.Property(
+        type=int,
+        flags=(
+            GObject.ParamFlags.READABLE |
+            GObject.ParamFlags.WRITABLE |
+            GObject.ParamFlags.CONSTRUCT_ONLY
+        ),
+    )
 
-        self.pattern_column.set_cell_data_func(self.validity_renderer,
-                                               self.valid_icon_celldata)
+    settings_key = GObject.Property(
+        type=str,
+        flags=(
+            GObject.ParamFlags.READABLE |
+            GObject.ParamFlags.WRITABLE |
+            GObject.ParamFlags.CONSTRUCT_ONLY
+        ),
+    )
 
-        for filtstring in getattr(self.prefs, self.key).split("\n"):
-            filt = filters.FilterEntry.parse(filtstring, filter_type)
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.model = self.treeview.get_model()
+
+        self.pattern_column.set_cell_data_func(
+            self.validity_renderer, self.valid_icon_celldata)
+
+        for filter_params in settings.get_value(self.settings_key):
+            filt = FilterEntry.new_from_gsetting(
+                filter_params, self.filter_type)
             if filt is None:
                 continue
             valid = filt.filter is not None
-            self.model.append([filt.label, filt.active,
-                               filt.filter_string, valid])
+            self.model.append(
+                [filt.label, filt.active, filt.filter_string, valid])
 
         for signal in ('row-changed', 'row-deleted', 'row-inserted',
                        'rows-reordered'):
             self.model.connect(signal, self._update_filter_string)
 
-        self._update_sensitivity()
+        self.setup_sensitivity_handling()
 
     def valid_icon_celldata(self, col, cell, model, it, user_data=None):
         is_valid = model.get_value(it, 3)
-        icon_name = "gtk-dialog-warning" if not is_valid else None
-        cell.set_property("stock-id", icon_name)
+        icon_name = "dialog-warning-symbolic" if not is_valid else None
+        cell.set_property("icon-name", icon_name)
 
+    @Gtk.Template.Callback()
+    def on_add_clicked(self, button):
+        self.add_entry()
+
+    @Gtk.Template.Callback()
+    def on_remove_clicked(self, button):
+        self.remove_selected_entry()
+
+    @Gtk.Template.Callback()
+    def on_move_up_clicked(self, button):
+        self.move_up_selected_entry()
+
+    @Gtk.Template.Callback()
+    def on_move_down_clicked(self, button):
+        self.move_down_selected_entry()
+
+    @Gtk.Template.Callback()
     def on_name_edited(self, ren, path, text):
         self.model[path][0] = text
 
+    @Gtk.Template.Callback()
     def on_cellrenderertoggle_toggled(self, ren, path):
         self.model[path][1] = not ren.get_active()
 
+    @Gtk.Template.Callback()
     def on_pattern_edited(self, ren, path, text):
-        filt = filters.FilterEntry.compile_filter(text, self.filter_type)
-        valid = filt is not None
+        valid = FilterEntry.check_filter(text, self.filter_type)
         self.model[path][2] = text
         self.model[path][3] = valid
 
     def _update_filter_string(self, *args):
-        pref = []
-        for row in self.model:
-            pattern = row[2]
-            if pattern:
-                pattern = pattern.replace('\r', '')
-                pattern = pattern.replace('\n', '')
-            pref.append("%s\t%s\t%s" % (row[0], 1 if row[1] else 0, pattern))
-        setattr(self.prefs, self.key, "\n".join(pref))
+        value = [(row[0], row[1], row[2]) for row in self.model]
+        settings.set_value(self.settings_key, GLib.Variant('a(sbs)', value))
 
 
-class ColumnList(listwidget.ListWidget):
+@Gtk.Template(resource_path='/org/gnome/meld/ui/column-list.ui')
+class ColumnList(Gtk.VBox, EditableListWidget):
 
-    available_columns = set((
-        "size",
-        "modification time",
-        "permissions",
-    ))
+    __gtype_name__ = "ColumnList"
 
-    def __init__(self, prefs, key):
-        listwidget.ListWidget.__init__(self, "EditableList.ui",
-                               "columns_ta", ["ColumnsListStore"],
-                               "columns_treeview")
-        self.prefs = prefs
-        self.key = key
+    treeview = Gtk.Template.Child()
+    remove = Gtk.Template.Child()
+    move_up = Gtk.Template.Child()
+    move_down = Gtk.Template.Child()
 
-        prefs_columns = []
-        for column in getattr(self.prefs, self.key):
-            column_name, visibility = column.rsplit(" ", 1)
-            visibility = bool(int(visibility))
-            prefs_columns.append((column_name, visibility))
+    default_entry = [_("label"), False, _("pattern"), True]
 
-        missing = self.available_columns - set([c[0] for c in prefs_columns])
-        prefs_columns.extend([(m, False) for m in missing])
-        for column_name, visibility in prefs_columns:
-            self.model.append([visibility, _(column_name.capitalize())])
+    available_columns = {
+        "size": _("Size"),
+        "modification time": _("Modification time"),
+        "iso-time": _("Modification time (ISO)"),
+        "permissions": _("Permissions"),
+    }
+
+    settings_key = GObject.Property(
+        type=str,
+        flags=(
+            GObject.ParamFlags.READABLE |
+            GObject.ParamFlags.WRITABLE |
+            GObject.ParamFlags.CONSTRUCT_ONLY
+        ),
+    )
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.model = self.treeview.get_model()
+
+        # Unwrap the variant
+        prefs_columns = [
+            (k, v) for k, v in settings.get_value(self.settings_key)
+        ]
+        column_vis = {}
+        column_order = {}
+        for sort_key, (column_name, visibility) in enumerate(prefs_columns):
+            column_vis[column_name] = bool(int(visibility))
+            column_order[column_name] = sort_key
+
+        columns = [
+            (column_vis.get(name, False), name, label)
+            for name, label in self.available_columns.items()
+        ]
+        columns = sorted(
+            columns,
+            key=lambda c: column_order.get(c[1], len(self.available_columns)),
+        )
+
+        for visibility, name, label in columns:
+            self.model.append([visibility, name, label])
 
         for signal in ('row-changed', 'row-deleted', 'row-inserted',
                        'rows-reordered'):
             self.model.connect(signal, self._update_columns)
 
-        self._update_sensitivity()
+        self.setup_sensitivity_handling()
 
+    @Gtk.Template.Callback()
+    def on_move_up_clicked(self, button):
+        self.move_up_selected_entry()
+
+    @Gtk.Template.Callback()
+    def on_move_down_clicked(self, button):
+        self.move_down_selected_entry()
+
+    @Gtk.Template.Callback()
     def on_cellrenderertoggle_toggled(self, ren, path):
         self.model[path][0] = not ren.get_active()
 
     def _update_columns(self, *args):
-        columns = ["%s %d" % (c[1].lower(), int(c[0])) for c in self.model]
-        setattr(self.prefs, self.key, columns)
+        value = [(c[1].lower(), c[0]) for c in self.model]
+        settings.set_value(self.settings_key, GLib.Variant('a(sb)', value))
 
 
-class PreferencesDialog(gnomeglade.Component):
-
-    def __init__(self, parent, prefs):
-        gnomeglade.Component.__init__(self, paths.ui_dir("preferences.ui"),
-                                      "preferencesdialog",
-                                      ["adjustment1", "adjustment2"])
-        self.widget.set_transient_for(parent)
-        self.prefs = prefs
-        if not self.prefs.use_custom_font:
-            self.checkbutton_default_font.set_active(True)
-            self.fontpicker.set_sensitive(False)
-        else:
-            self.checkbutton_default_font.set_active(False)
-            self.fontpicker.set_sensitive(True)
-            self.fontpicker.set_font_name(self.prefs.custom_font)
-        self.fontpicker.set_font_name( self.prefs.custom_font )
-        self.spinbutton_tabsize.set_value( self.prefs.tab_size )
-        if srcviewer.gsv is not None:
-            self.checkbutton_spaces_instead_of_tabs.set_active( self.prefs.spaces_instead_of_tabs )
-            self.checkbutton_show_line_numbers.set_active( self.prefs.show_line_numbers )
-            self.checkbutton_show_whitespace.set_active(self.prefs.show_whitespace)
-            self.checkbutton_use_syntax_highlighting.set_active( self.prefs.use_syntax_highlighting )
-        else:
-            no_sourceview_text = \
-                _("Only available if you have gnome-python-desktop installed")
-            for w in (self.checkbutton_spaces_instead_of_tabs,
-                      self.checkbutton_show_line_numbers,
-                      self.checkbutton_use_syntax_highlighting,
-                      self.checkbutton_show_whitespace):
-                w.set_sensitive(False)
-                w.set_tooltip_text(no_sourceview_text)
-        # TODO: This doesn't restore the state of character wrapping when word
-        # wrapping is disabled, but this is hard with our existing gconf keys
-        if self.prefs.edit_wrap_lines != gtk.WRAP_NONE:
-            if self.prefs.edit_wrap_lines == gtk.WRAP_CHAR:
-                self.checkbutton_split_words.set_active(False)
-            self.checkbutton_wrap_text.set_active(True)
-
-        size_group = gtk.SizeGroup(gtk.SIZE_GROUP_HORIZONTAL)
-        size_group.add_widget(self.label1)
-        size_group.add_widget(self.label2)
-        size_group.add_widget(self.label16)
-        use_default = self.prefs.edit_command_type == "internal" or \
-                      self.prefs.edit_command_type == "gnome"
-        self.system_editor_checkbutton.set_active(use_default)
-        self.custom_edit_command_entry.set_sensitive(not use_default)
-        self.custom_edit_command_entry.set_text(self.prefs.edit_command_custom)
-
-        # file filters
-        self.filefilter = FilterList(self.prefs, "filters",
-                                     filters.FilterEntry.SHELL)
-        self.file_filters_tab.pack_start(self.filefilter.widget)
-        self.checkbutton_ignore_symlinks.set_active( self.prefs.ignore_symlinks)
-
-        # text filters
-        self.textfilter = FilterList(self.prefs, "regexes",
-                                     filters.FilterEntry.REGEX)
-        self.text_filters_tab.pack_start(self.textfilter.widget)
-        self.checkbutton_ignore_blank_lines.set_active( self.prefs.ignore_blank_lines )
-        # encoding
-        self.entry_text_codecs.set_text( self.prefs.text_codecs )
-
-        columnlist = ColumnList(self.prefs, "dirdiff_columns")
-        self.column_list_vbox.pack_start(columnlist.widget)
-
-        self.checkbutton_shallow_compare.set_active(
-                self.prefs.dirdiff_shallow_comparison)
-
-        self.combo_timestamp.lock = True
-        model = gtk.ListStore(str, int)
-        active_idx = 0
-        for i, entry in enumerate(TIMESTAMP_RESOLUTION_PRESETS):
-            model.append(entry)
-            if entry[1] == self.prefs.dirdiff_time_resolution_ns:
-                active_idx = i
-        self.combo_timestamp.set_model(model)
-        cell = gtk.CellRendererText()
-        self.combo_timestamp.pack_start(cell, False)
-        self.combo_timestamp.add_attribute(cell, 'text', 0)
-        self.combo_timestamp.set_active(active_idx)
-        self.combo_timestamp.lock = False
-
-        self.checkbutton_show_commit_margin.set_active(
-            self.prefs.vc_show_commit_margin)
-        self.spinbutton_commit_margin.set_value(
-            self.prefs.vc_commit_margin)
-        self.checkbutton_break_commit_lines.set_sensitive(
-            self.prefs.vc_show_commit_margin)
-        self.checkbutton_break_commit_lines.set_active(
-            self.prefs.vc_break_commit_message)
-
-        self.widget.show()
-
-    def on_fontpicker_font_set(self, picker):
-        self.prefs.custom_font = picker.get_font_name()
-
-    def on_checkbutton_default_font_toggled(self, button):
-        use_custom = not button.get_active()
-        self.fontpicker.set_sensitive(use_custom)
-        self.prefs.use_custom_font = use_custom
-
-    def on_spinbutton_tabsize_changed(self, spin):
-        self.prefs.tab_size = int(spin.get_value())
-    def on_checkbutton_spaces_instead_of_tabs_toggled(self, check):
-        self.prefs.spaces_instead_of_tabs = check.get_active()
-
-    def on_checkbutton_wrap_text_toggled(self, button):
-        if not self.checkbutton_wrap_text.get_active():
-            self.prefs.edit_wrap_lines = 0
-            self.checkbutton_split_words.set_sensitive(False)
-        else:
-            self.checkbutton_split_words.set_sensitive(True)
-            if self.checkbutton_split_words.get_active():
-                self.prefs.edit_wrap_lines = 2
-            else:
-                self.prefs.edit_wrap_lines = 1
-
-    def on_checkbutton_show_line_numbers_toggled(self, check):
-        self.prefs.show_line_numbers = check.get_active()
-    def on_checkbutton_show_whitespace_toggled(self, check):
-        self.prefs.show_whitespace = check.get_active()
-    def on_checkbutton_use_syntax_highlighting_toggled(self, check):
-        self.prefs.use_syntax_highlighting = check.get_active()
-
-    def on_system_editor_checkbutton_toggled(self, check):
-        use_default = check.get_active()
-        self.custom_edit_command_entry.set_sensitive(not use_default)
-        if use_default:
-            self.prefs.edit_command_type = "gnome"
-        else:
-            self.prefs.edit_command_type = "custom"
-
-    def on_custom_edit_command_entry_activate(self, entry, *args):
-        # Called on "activate" and "focus-out-event"
-        self.prefs.edit_command_custom = entry.props.text
-
-    def on_checkbutton_show_line_numbers_toggled(self, check):
-        self.prefs.show_line_numbers = check.get_active()
-
-    def on_checkbutton_show_commit_margin_toggled(self, check):
-        show_margin = check.get_active()
-        self.prefs.vc_show_commit_margin = show_margin
-        self.checkbutton_break_commit_lines.set_sensitive(show_margin)
-
-    def on_spinbutton_commit_margin_value_changed(self, spin):
-        self.prefs.vc_commit_margin = int(spin.get_value())
-
-    def on_checkbutton_break_commit_lines_toggled(self, check):
-        self.prefs.vc_break_commit_message = check.get_active()
-
-    #
-    # filters
-    #
-    def on_checkbutton_ignore_symlinks_toggled(self, check):
-        self.prefs.ignore_symlinks = check.get_active()
-    def on_checkbutton_ignore_blank_lines_toggled(self, check):
-        self.prefs.ignore_blank_lines = check.get_active()
-
-    def on_entry_text_codecs_activate(self, entry, *args):
-        # Called on "activate" and "focus-out-event"
-        self.prefs.text_codecs = entry.props.text
-
-    def on_checkbutton_shallow_compare_toggled(self, check):
-        self.prefs.dirdiff_shallow_comparison = check.get_active()
-
-    def on_combo_timestamp_changed(self, combo):
-        if not combo.lock:
-            resolution = combo.get_model()[combo.get_active_iter()][1]
-            self.prefs.dirdiff_time_resolution_ns = resolution
-
-    def on_response(self, dialog, response_id):
-        self.widget.destroy()
-
-
-class MeldPreferences(prefs.Preferences):
-    defaults = {
-        "window_size_x": prefs.Value(prefs.INT, 600),
-        "window_size_y": prefs.Value(prefs.INT, 600),
-        "use_custom_font": prefs.Value(prefs.BOOL,0),
-        "custom_font": prefs.Value(prefs.STRING,"monospace, 14"),
-        "tab_size": prefs.Value(prefs.INT, 4),
-        "spaces_instead_of_tabs": prefs.Value(prefs.BOOL, False),
-        "show_line_numbers": prefs.Value(prefs.BOOL, 0),
-        "show_whitespace": prefs.Value(prefs.BOOL, False),
-        "use_syntax_highlighting": prefs.Value(prefs.BOOL, 0),
-        "edit_wrap_lines" : prefs.Value(prefs.INT, 0),
-        "edit_command_type" : prefs.Value(prefs.STRING, "gnome"), #gnome, custom
-        "edit_command_custom" : prefs.Value(prefs.STRING, "gedit"),
-        "text_codecs": prefs.Value(prefs.STRING, "utf8 latin1"),
-        "ignore_symlinks": prefs.Value(prefs.BOOL,0),
-        "vc_console_visible": prefs.Value(prefs.BOOL, 0),
-        "filters" : prefs.Value(prefs.STRING,
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("Backups\t1\t#*# .#* ~* *~ *.{orig,bak,swp}\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("OS-specific metadata\t0\t.DS_Store ._* .Spotlight-V100 .Trashes Thumbs.db Desktop.ini\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("Version Control\t1\t%s\n") % misc.shell_escape(' '.join(vc.get_plugins_metadata())) + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("Binaries\t1\t*.{pyc,a,obj,o,so,la,lib,dll,exe}\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("Media\t0\t*.{jpg,gif,png,bmp,wav,mp3,ogg,flac,avi,mpg,xcf,xpm}")),
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-        "regexes" : prefs.Value(prefs.STRING, _("CVS keywords\t0\t\$\\w+(:[^\\n$]+)?\$\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("C++ comment\t0\t//.*\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("C comment\t0\t/\*.*?\*/\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("All whitespace\t0\t[ \\t\\r\\f\\v]*\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("Leading whitespace\t0\t^[ \\t\\r\\f\\v]*\n") + \
-            #TRANSLATORS: translate this string ONLY to the first "\t", leave it and the following parts intact
-            _("Script comment\t0\t#.*")),
-        "ignore_blank_lines" : prefs.Value(prefs.BOOL, False),
-        "toolbar_visible" : prefs.Value(prefs.BOOL, True),
-        "statusbar_visible" : prefs.Value(prefs.BOOL, True),
-        "dir_status_filters": prefs.Value(prefs.LIST,
-                                          ['normal', 'modified', 'new']),
-        "vc_status_filters": prefs.Value(prefs.LIST,
-                                         ['flatten', 'modified']),
-        # Currently, we're using a quite simple format to store the columns:
-        # each line contains a column name followed by a 1 or a 0
-        # depending on whether the column is visible or not.
-        "dirdiff_columns": prefs.Value(prefs.LIST,
-                                         ["size 1", "modification time 1",
-                                          "permissions 0"]),
-        "dirdiff_shallow_comparison" : prefs.Value(prefs.BOOL, False),
-        "dirdiff_time_resolution_ns" : prefs.Value(prefs.INT, 100),
-
-        "vc_show_commit_margin": prefs.Value(prefs.BOOL, True),
-        "vc_commit_margin": prefs.Value(prefs.INT, 72),
-        "vc_break_commit_message": prefs.Value(prefs.BOOL, False),
-    }
+class GSettingsComboBox(Gtk.ComboBox):
 
     def __init__(self):
-        super(MeldPreferences, self).__init__("/apps/meld", self.defaults)
+        super().__init__()
+        self.connect('notify::gsettings-value', self._setting_changed)
+        self.connect('notify::active', self._active_changed)
 
-    def get_current_font(self):
-        if self.use_custom_font:
-            return self.custom_font
+    def bind_to(self, key):
+        settings.bind(
+            key, self, 'gsettings-value', Gio.SettingsBindFlags.DEFAULT)
+
+    def _setting_changed(self, obj, val):
+        column = self.get_property('gsettings-column')
+        value = self.get_property('gsettings-value')
+
+        for row in self.get_model():
+            if value == row[column]:
+                idx = row.path[0]
+                break
         else:
-            if not hasattr(self, "_gconf"):
-                return "Monospace 10"
-            return self._gconf.get_string('/desktop/gnome/interface/monospace_font_name') or "Monospace 10"
+            idx = 0
 
-    def get_toolbar_style(self):
-        if not hasattr(self, "_gconf"):
-            style = "both-horiz"
+        if self.get_property('active') != idx:
+            self.set_property('active', idx)
+
+    def _active_changed(self, obj, val):
+        active_iter = self.get_active_iter()
+        if active_iter is None:
+            return
+        column = self.get_property('gsettings-column')
+        value = self.get_model()[active_iter][column]
+        self.set_property('gsettings-value', value)
+
+
+class GSettingsIntComboBox(GSettingsComboBox):
+
+    __gtype_name__ = "GSettingsIntComboBox"
+
+    gsettings_column = GObject.Property(type=int, default=0)
+    gsettings_value = GObject.Property(type=int)
+
+
+class GSettingsBoolComboBox(GSettingsComboBox):
+
+    __gtype_name__ = "GSettingsBoolComboBox"
+
+    gsettings_column = GObject.Property(type=int, default=0)
+    gsettings_value = GObject.Property(type=bool, default=False)
+
+
+class GSettingsStringComboBox(GSettingsComboBox):
+
+    __gtype_name__ = "GSettingsStringComboBox"
+
+    gsettings_column = GObject.Property(type=int, default=0)
+    gsettings_value = GObject.Property(type=str, default="")
+
+
+@Gtk.Template(resource_path='/org/gnome/meld/ui/preferences.ui')
+class PreferencesDialog(Gtk.Dialog):
+
+    __gtype_name__ = "PreferencesDialog"
+
+    checkbutton_break_commit_lines = Gtk.Template.Child()
+    checkbutton_default_font = Gtk.Template.Child()
+    checkbutton_folder_filter_text = Gtk.Template.Child()
+    checkbutton_highlight_current_line = Gtk.Template.Child()
+    checkbutton_ignore_blank_lines = Gtk.Template.Child()
+    checkbutton_ignore_symlinks = Gtk.Template.Child()
+    checkbutton_prefer_dark_theme = Gtk.Template.Child()
+    checkbutton_shallow_compare = Gtk.Template.Child()
+    checkbutton_show_commit_margin = Gtk.Template.Child()
+    checkbutton_show_line_numbers = Gtk.Template.Child()
+    checkbutton_show_overview_map = Gtk.Template.Child()
+    checkbutton_show_whitespace = Gtk.Template.Child()
+    checkbutton_spaces_instead_of_tabs = Gtk.Template.Child()
+    checkbutton_use_syntax_highlighting = Gtk.Template.Child()
+    checkbutton_wrap_text = Gtk.Template.Child()
+    checkbutton_wrap_word = Gtk.Template.Child()
+    column_list_vbox = Gtk.Template.Child()
+    combo_file_order = Gtk.Template.Child()
+    combo_merge_order = Gtk.Template.Child()
+    combo_overview_map = Gtk.Template.Child()
+    combo_timestamp = Gtk.Template.Child()
+    combobox_style_scheme = Gtk.Template.Child()
+    custom_edit_command_entry = Gtk.Template.Child()
+    file_filters_vbox = Gtk.Template.Child()
+    fontpicker = Gtk.Template.Child()
+    spinbutton_commit_margin = Gtk.Template.Child()
+    spinbutton_tabsize = Gtk.Template.Child()
+    syntaxschemestore = Gtk.Template.Child()
+    system_editor_checkbutton = Gtk.Template.Child()
+    text_filters_vbox = Gtk.Template.Child()
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        bindings = [
+            ('use-system-font', self.checkbutton_default_font, 'active'),
+            ('custom-font', self.fontpicker, 'font'),
+            ('indent-width', self.spinbutton_tabsize, 'value'),
+            ('insert-spaces-instead-of-tabs', self.checkbutton_spaces_instead_of_tabs, 'active'),  # noqa: E501
+            ('highlight-current-line', self.checkbutton_highlight_current_line, 'active'),  # noqa: E501
+            ('show-line-numbers', self.checkbutton_show_line_numbers, 'active'),  # noqa: E501
+            ('prefer-dark-theme', self.checkbutton_prefer_dark_theme, 'active'),  # noqa: E501
+            ('highlight-syntax', self.checkbutton_use_syntax_highlighting, 'active'),  # noqa: E501
+            ('enable-space-drawer', self.checkbutton_show_whitespace, 'active'),  # noqa: E501
+            ('use-system-editor', self.system_editor_checkbutton, 'active'),
+            ('custom-editor-command', self.custom_edit_command_entry, 'text'),
+            ('folder-shallow-comparison', self.checkbutton_shallow_compare, 'active'),  # noqa: E501
+            ('folder-filter-text', self.checkbutton_folder_filter_text, 'active'),  # noqa: E501
+            ('folder-ignore-symlinks', self.checkbutton_ignore_symlinks, 'active'),  # noqa: E501
+            ('vc-show-commit-margin', self.checkbutton_show_commit_margin, 'active'),  # noqa: E501
+            ('show-overview-map', self.checkbutton_show_overview_map, 'active'),  # noqa: E501
+            ('vc-commit-margin', self.spinbutton_commit_margin, 'value'),
+            ('vc-break-commit-message', self.checkbutton_break_commit_lines, 'active'),  # noqa: E501
+            ('ignore-blank-lines', self.checkbutton_ignore_blank_lines, 'active'),  # noqa: E501
+            # Sensitivity bindings must come after value bindings, or the key
+            # writability in gsettings overrides manual sensitivity setting.
+            ('vc-show-commit-margin', self.spinbutton_commit_margin, 'sensitive'),  # noqa: E501
+            ('vc-show-commit-margin', self.checkbutton_break_commit_lines, 'sensitive'),  # noqa: E501
+        ]
+        for key, obj, attribute in bindings:
+            settings.bind(key, obj, attribute, Gio.SettingsBindFlags.DEFAULT)
+
+        invert_bindings = [
+            ('use-system-editor', self.custom_edit_command_entry, 'sensitive'),
+            ('use-system-font', self.fontpicker, 'sensitive'),
+            ('folder-shallow-comparison', self.checkbutton_folder_filter_text, 'sensitive'),  # noqa: E501
+        ]
+        for key, obj, attribute in invert_bindings:
+            settings.bind(
+                key, obj, attribute, Gio.SettingsBindFlags.DEFAULT |
+                Gio.SettingsBindFlags.INVERT_BOOLEAN)
+
+        self.checkbutton_wrap_text.bind_property(
+            'active', self.checkbutton_wrap_word, 'sensitive',
+            GObject.BindingFlags.DEFAULT)
+
+        wrap_mode = settings.get_enum('wrap-mode')
+        self.checkbutton_wrap_text.set_active(wrap_mode != Gtk.WrapMode.NONE)
+        self.checkbutton_wrap_word.set_active(wrap_mode == Gtk.WrapMode.WORD)
+
+        filefilter = FilterList(
+            filter_type=FilterEntry.SHELL,
+            settings_key="filename-filters",
+        )
+        self.file_filters_vbox.pack_start(filefilter, True, True, 0)
+
+        textfilter = FilterList(
+            filter_type=FilterEntry.REGEX,
+            settings_key="text-filters",
+        )
+        self.text_filters_vbox.pack_start(textfilter, True, True, 0)
+
+        columnlist = ColumnList(settings_key="folder-columns")
+        self.column_list_vbox.pack_start(columnlist, True, True, 0)
+
+        self.combo_timestamp.bind_to('folder-time-resolution')
+        self.combo_file_order.bind_to('vc-left-is-local')
+        self.combo_overview_map.bind_to('overview-map-style')
+        self.combo_merge_order.bind_to('vc-merge-file-order')
+
+        # Fill color schemes
+        manager = GtkSource.StyleSchemeManager.get_default()
+        for scheme_id in manager.get_scheme_ids():
+            scheme = manager.get_scheme(scheme_id)
+            self.syntaxschemestore.append([scheme_id, scheme.get_name()])
+        self.combobox_style_scheme.bind_to('style-scheme')
+
+        self.show()
+
+    @Gtk.Template.Callback()
+    def on_checkbutton_wrap_text_toggled(self, button):
+        if not self.checkbutton_wrap_text.get_active():
+            wrap_mode = Gtk.WrapMode.NONE
+        elif self.checkbutton_wrap_word.get_active():
+            wrap_mode = Gtk.WrapMode.WORD
         else:
-            style = self._gconf.get_string(
-                      '/desktop/gnome/interface/toolbar_style') or "both-horiz"
-        toolbar_styles = {
-            "both": gtk.TOOLBAR_BOTH, "text": gtk.TOOLBAR_TEXT,
-            "icon": gtk.TOOLBAR_ICONS, "icons": gtk.TOOLBAR_ICONS,
-            "both_horiz": gtk.TOOLBAR_BOTH_HORIZ,
-            "both-horiz": gtk.TOOLBAR_BOTH_HORIZ
-        }
-        return toolbar_styles[style]
+            wrap_mode = Gtk.WrapMode.CHAR
+        settings.set_enum('wrap-mode', wrap_mode)
 
-    def get_editor_command(self, path, line=0):
-        if self.edit_command_type == "custom":
-            custom_command = self.edit_command_custom
-            fmt = string.Formatter()
-            replacements = [tok[1] for tok in fmt.parse(custom_command)]
-
-            if not any(replacements):
-                cmd = " ".join([custom_command, path])
-            elif not all(r in (None, 'file', 'line') for r in replacements):
-                cmd = " ".join([custom_command, path])
-                log.error("Unsupported fields found", )
-            else:
-                cmd = custom_command.format(file=path, line=line)
-            return shlex.split(cmd)
-        else:
-            if not hasattr(self, "_gconf"):
-                return []
-
-            editor_path = "/desktop/gnome/applications/editor/"
-            terminal_path = "/desktop/gnome/applications/terminal/"
-            editor = self._gconf.get_string(editor_path + "exec") or "gedit"
-            if self._gconf.get_bool(editor_path + "needs_term"):
-                argv = []
-                texec = self._gconf.get_string(terminal_path + "exec")
-                if texec:
-                    argv.append(texec)
-                    targ = self._gconf.get_string(terminal_path + "exec_arg")
-                    if targ:
-                        argv.append(targ)
-                escaped_path = path.replace(" ", "\\ ")
-                argv.append("%s %s" % (editor, escaped_path))
-                return argv
-            else:
-                return [editor, path]
+    @Gtk.Template.Callback()
+    def on_response(self, dialog, response_id):
+        self.destroy()

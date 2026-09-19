@@ -1,4 +1,5 @@
 # Copyright (C) 2002-2005 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2012-2015 Kai Willadsen <kai.willadsen@gmail.com>
 
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -21,16 +22,29 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
 # THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
+import shutil
+import tempfile
+
+from meld.conf import _
 from meld.vc import _vc
 
 
 class Vc(_vc.Vc):
 
     CMD = None
-    NAME = ""
+    # Translators: This is the displayed name of a version control system
+    # when no version control system is actually found.
+    NAME = _("None")
     VC_DIR = "."
 
-    def lookup_files(self, dirs, files, directory=None):
-        dirs = [_vc.Dir(d[1], d[0], _vc.STATE_NONE) for d in dirs]
-        files = [_vc.File(f[1], f[0], _vc.STATE_NONE) for f in files]
-        return dirs, files
+    def _update_tree_state_cache(*args):
+        pass
+
+    def get_path_for_repo_file(self, path, commit=None):
+        suffix = os.path.splitext(path)[1]
+        with tempfile.NamedTemporaryFile(
+                prefix='meld-tmp', suffix=suffix, delete=False) as f:
+            with open(path, 'rb') as vc_file:
+                shutil.copyfileobj(vc_file, f)
+        return f.name

@@ -1,39 +1,44 @@
-### Copyright (C) 2002-2009 Stephen Kennedy <stevek@gnome.org>
-### Copyright (C) 2010-2011 Kai Willadsen <kai.willadsen@gmail.com>
-
-### This program is free software; you can redistribute it and/or modify
-### it under the terms of the GNU General Public License as published by
-### the Free Software Foundation; either version 2 of the License, or
-### (at your option) any later version.
-
-### This program is distributed in the hope that it will be useful,
-### but WITHOUT ANY WARRANTY; without even the implied warranty of
-### MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-### GNU General Public License for more details.
-
-### You should have received a copy of the GNU General Public License
-### along with this program; if not, write to the Free Software
-### Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301,
-### USA.
+# Copyright (C) 2002-2009 Stephen Kennedy <stevek@gnome.org>
+# Copyright (C) 2010-2011, 2013, 2018 Kai Willadsen <kai.willadsen@gmail.com>
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 2 of the License, or (at
+# your option) any later version.
+#
+# This program is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-from meld import paths
-from . import gnomeglade
+class EditableListWidget:
 
+    """Helper class with behaviour for simple editable lists
 
-class ListWidget(gnomeglade.Component):
+    The entire point of this is to handle simple list item addition,
+    removal, and rearrangement, and the associated sensitivity handling.
 
-    def __init__(self, ui_file, widget, store, treeview, new_row_data=None):
-        gnomeglade.Component.__init__(self, paths.ui_dir(ui_file),
-                                      widget, store)
-        self.new_row_data = new_row_data
-        self.list = getattr(self, treeview)
-        self.model = self.list.get_model()
-        selection = self.list.get_selection()
-        selection.connect("changed", self._update_sensitivity)
+    This requires template children to be bound as:
+      * `treeview`
+      * `remove`
+      * `move_up`
+      * `move_down`
+    """
+
+    def setup_sensitivity_handling(self):
+        model = self.treeview.get_model()
+        model.connect("row-inserted", self._update_sensitivity)
+        model.connect("rows-reordered", self._update_sensitivity)
+        self.treeview.get_selection().connect(
+            "changed", self._update_sensitivity)
+        self._update_sensitivity()
 
     def _update_sensitivity(self, *args):
-        (model, it, path) = self._get_selected()
+        model, it, path = self._get_selected()
         if not it:
             self.remove.set_sensitive(False)
             self.move_up.set_sensitive(False)
@@ -44,24 +49,21 @@ class ListWidget(gnomeglade.Component):
             self.move_down.set_sensitive(path < len(model) - 1)
 
     def _get_selected(self):
-        (model, it) = self.list.get_selection().get_selected()
-        if it:
-            path = model.get_path(it)[0]
-        else:
-            path = None
+        model, it = self.treeview.get_selection().get_selected()
+        path = model.get_path(it)[0] if it else None
         return (model, it, path)
 
-    def on_add_clicked(self, button):
-        self.model.append(self.new_row_data)
+    def add_entry(self):
+        self.treeview.get_model().append(self.default_entry)
 
-    def on_remove_clicked(self, button):
-        (model, it, path) = self._get_selected()
-        self.model.remove(it)
+    def remove_selected_entry(self):
+        model, it, path = self._get_selected()
+        model.remove(it)
 
-    def on_move_up_clicked(self, button):
-        (model, it, path) = self._get_selected()
+    def move_up_selected_entry(self):
+        model, it, path = self._get_selected()
         model.swap(it, model.get_iter(path - 1))
 
-    def on_move_down_clicked(self, button):
-        (model, it, path) = self._get_selected()
+    def move_down_selected_entry(self):
+        model, it, path = self._get_selected()
         model.swap(it, model.get_iter(path + 1))

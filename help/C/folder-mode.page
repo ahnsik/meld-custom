@@ -148,8 +148,8 @@ states are:
       <td><p>Modified</p></td>
       <td>
         <p>
-        Red and bold
-<!--        <file style="color: #880000; font-weight: bold">file.txt</file>-->
+        Blue and bold
+<!--        <file style="color: #0044dd; font-weight: bold">file.txt</file>-->
         </p>
       </td>
       <td>
@@ -216,12 +216,12 @@ states are:
 
 <p>
 You can filter out files based on these states, for example, to show only
-files that have are <em>Modified</em>. You can read more about this in
+files that have been <em>Modified</em>. You can read more about this in
 <link xref="file-filters#file-state-filter"/>.
 </p>
 
 <p>
-Finally, the most recently modified file/folder has an emblem
+Finally, the most recently modified file/folder has a small star emblem
 attached to it.
 </p>
 </section>
