@@ -1,6 +1,9 @@
 
-About Meld
+About Meld-custom
 ==========
+
+Meld customized by ahnsik:
+- Linux에서, OpenSource meld 소스코드를 다운로드 받아 WinMerge 에 있는 좋은 기능들을 일부 적용하여 개선한 프로그램.
 
 Meld is a visual diff and merge tool targeted at developers. Meld helps you
 compare files, directories, and version controlled projects. It provides
