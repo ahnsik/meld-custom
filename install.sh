@@ -6,6 +6,8 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PREFIX=${PREFIX:-"$HOME/.local"}
 APP_DIR="$PREFIX/lib/meld-cutrom"
 BIN_DIR="$PREFIX/bin"
+APPLICATIONS_DIR="$PREFIX/share/applications"
+ICON_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
 
 for command_name in python3 glib-compile-resources glib-compile-schemas; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
@@ -23,7 +25,7 @@ if ! python3 -c \
     exit 1
 fi
 
-install -d "$APP_DIR" "$BIN_DIR"
+install -d "$APP_DIR" "$BIN_DIR" "$APPLICATIONS_DIR" "$ICON_DIR"
 rm -rf -- "$APP_DIR/bin" "$APP_DIR/data" "$APP_DIR/meld"
 cp -a "$SCRIPT_DIR/bin" "$SCRIPT_DIR/data" "$SCRIPT_DIR/meld" "$APP_DIR/"
 install -m 644 "$SCRIPT_DIR/meld.doap" "$SCRIPT_DIR/COPYING" "$APP_DIR/"
@@ -37,6 +39,28 @@ glib-compile-schemas "$APP_DIR/data"
 
 chmod 755 "$APP_DIR/bin/meld"
 ln -sfn "$APP_DIR/bin/meld" "$BIN_DIR/meld_cu"
+install -m 644 \
+    "$SCRIPT_DIR/data/icons/hicolor/scalable/apps/org.gnome.Meld.svg" \
+    "$ICON_DIR/org.gnome.Meld.svg"
+if [ ! -f "$PREFIX/share/icons/hicolor/index.theme" ] &&
+        [ -f /usr/share/icons/hicolor/index.theme ]; then
+    install -m 644 \
+        /usr/share/icons/hicolor/index.theme \
+        "$PREFIX/share/icons/hicolor/index.theme"
+fi
+install -m 644 \
+    "$SCRIPT_DIR/data/org.gnome.MeldCu.desktop" \
+    "$APPLICATIONS_DIR/org.gnome.MeldCu.desktop"
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    if ! gtk-update-icon-cache -f -t \
+            "$PREFIX/share/icons/hicolor" >/dev/null 2>&1; then
+        echo "경고: 아이콘 캐시를 갱신하지 못했지만 아이콘 설치는 완료되었습니다." >&2
+    fi
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPLICATIONS_DIR"
+fi
 
 echo "Meld_cutrom 설치가 완료되었습니다."
 echo "실행 명령: meld_cu"
