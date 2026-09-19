@@ -1,0 +1,95 @@
+include: 'https://gitlab.gnome.org/GNOME/citemplates/raw/master/flatpak/flatpak_ci_initiative.yml'
+
+variables:
+  GNOME_SDK: 42
+
+image: quay.io/gnome_infrastructure/gnome-runtime-images:gnome-${GNOME_SDK}
+
+stages:
+  - check
+  - test
+  - build
+  - deploy
+
+
+flatpak:
+    extends: .flatpak
+    stage: build
+    variables:
+        MANIFEST_PATH: "data/org.gnome.MeldDevel.json"
+        FLATPAK_MODULE: "meld"
+        RUNTIME_REPO: "https://nightly.gnome.org/gnome-nightly.flatpakrepo"
+        APP_ID: "org.gnome.MeldDevel"
+        BUNDLE: "meld-dev.flatpak"
+
+nightly:
+  extends: '.publish_nightly'
+  dependencies:
+    - 'flatpak'
+
+.pythonchecks:
+  stage: check
+  image: registry.fedoraproject.org/fedora:latest
+  script:
+   - dnf install -y git glib2 gtk3 gtksourceview4 python3-cairo python3-pip python3-gobject-base
+   - pip3 install -r dev-requirements.txt
+   - $PYTHON_CHECK_COMMAND
+
+.pythonflatpak:
+  stage: check
+  tags: # test in the same org.gnome.Sdk environment that is used for creating flatpaks
+    - flatpak
+  script:
+    - flatpak run --share=network --filesystem=`pwd` --env=PATH=$PATH:/var/data/python/bin --command=sh org.gnome.Sdk -c 'pip3 install --user -r dev-requirements.txt; $PYTHON_CHECK_COMMAND'
+
+lint:
+  extends: .pythonchecks
+  variables:
+      PYTHON_CHECK_COMMAND: "pre-commit run --all-files --show-diff-on-failure"
+
+pytest:
+  extends: .pythonchecks
+  variables:
+      PYTHON_CHECK_COMMAND: "pytest"
+
+pytest-flatpak:
+  extends: .pythonflatpak
+  variables:
+      PYTHON_CHECK_COMMAND: "pytest"
+  # Ideally this wouldn't allow failure, but currently the flatpak environment
+  # is broken. https://gitlab.gnome.org/GNOME/gnome-runtime-images/-/issues/7
+  allow_failure: true
+
+mingw64-dist:
+  stage: build
+  variables:
+    MSYS2_ARCH: "x86_64"
+    MSYSTEM: "MINGW64"
+    CHERE_INVOKING: "yes"
+  tags: # select gitlab runners with specific tag (unrelated to git repo tags)
+    - win32-ps
+  artifacts:
+    name: "${env:CI_JOB_STAGE}-${env:CI_COMMIT_REF_NAME}"
+    paths:
+      - dist/
+  before_script:
+    - $env:Path = "C:\msys64\${env:MSYSTEM}\bin;C:\msys64\usr\bin;${env:PATH}"
+    - >
+      C:\msys64\usr\bin\pacman --noconfirm -S --refresh --sysupgrade --needed
+      mingw-w64-${env:MSYS2_ARCH}-adwaita-icon-theme
+      mingw-w64-${env:MSYS2_ARCH}-gsettings-desktop-schemas
+      mingw-w64-${env:MSYS2_ARCH}-gtk-update-icon-cache
+      mingw-w64-${env:MSYS2_ARCH}-gtk3
+      mingw-w64-${env:MSYS2_ARCH}-gtksourceview4
+      mingw-w64-${env:MSYS2_ARCH}-python3-cx_Freeze
+      mingw-w64-${env:MSYS2_ARCH}-python3-gobject
+      mingw-w64-${env:MSYS2_ARCH}-python3-pytest
+      mingw-w64-${env:MSYS2_ARCH}-python3-setuptools
+      glib2-devel
+      intltool
+  script:
+    - glib-compile-schemas data
+    - python3 setup_win32.py bdist_dumb --bdist-dir build\bdist.mingw\msi --keep-temp bdist_msi --keep-temp
+  # main purpose of this job is creating installers and not checking for breakage by changes in code
+  # so allow failures since the status of the build may depend on updates of rolling-release msys2 packages
+  allow_failure: true

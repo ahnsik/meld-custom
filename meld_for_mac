@@ -1,0 +1,11 @@
+#!/bin/sh
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+MELD_APP="$SCRIPT_DIR/Meld_for_mac.app/Contents/MacOS/Meld"
+
+if [ ! -x "$MELD_APP" ]; then
+    echo "meld_for_mac: 먼저 ./build_meld_for_mac.sh 를 실행하세요." >&2
+    exit 127
+fi
+
+exec "$MELD_APP" "$@"

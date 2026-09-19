@@ -4,3 +4,6 @@
 *.desktop
 *.install
 data/mime/meld.xml
+.build/
+Meld_custom.app/
+Meld_for_mac.app/
