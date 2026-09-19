@@ -16,4 +16,6 @@ Run the customized build:
 ./meld_for_mac
 ```
 
-The launcher uses the locally built `Meld_for_mac.app` bundle.
+The launcher uses the locally built `Meld_for_mac.app` bundle. On macOS, the
+application uses left-aligned traffic-light window controls and macOS-specific
+styling for title bars, tabs, buttons, selectors, and menus.

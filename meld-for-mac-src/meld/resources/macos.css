@@ -1,0 +1,205 @@
+/*
+ * macOS-specific GTK styling. This stylesheet is loaded only on Darwin so
+ * the upstream appearance remains unchanged on other platforms.
+ */
+
+window,
+dialog {
+  font-family: "Helvetica Neue";
+  font-size: 13px;
+}
+
+headerbar {
+  min-height: 38px;
+  padding: 4px 8px;
+  border-width: 0 0 1px;
+  border-style: solid;
+  border-color: alpha(@borders, 0.85);
+  border-radius: 8px 8px 0 0;
+  background-image: linear-gradient(
+    to bottom,
+    shade(@theme_bg_color, 1.06),
+    shade(@theme_bg_color, 0.98)
+  );
+  box-shadow: inset 0 1px alpha(white, 0.35);
+}
+
+headerbar:backdrop {
+  color: @unfocused_fg_color;
+  border-color: @unfocused_borders;
+  background-image: none;
+  background-color: @theme_bg_color;
+  box-shadow: none;
+}
+
+headerbar .title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+headerbar button {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 2px 7px;
+  border-radius: 6px;
+  box-shadow: none;
+}
+
+headerbar button:active,
+headerbar button:checked {
+  box-shadow: inset 0 1px 2px alpha(black, 0.16);
+}
+
+/* Match the order, shape, and colours of macOS traffic-light controls. */
+headerbar button.titlebutton {
+  min-width: 12px;
+  min-height: 12px;
+  padding: 0;
+  margin: 0 3px;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 999px;
+  background-image: none;
+  box-shadow: none;
+}
+
+headerbar button.titlebutton image {
+  opacity: 0;
+}
+
+headerbar button.titlebutton:hover image {
+  opacity: 0.55;
+}
+
+headerbar button.titlebutton.close {
+  color: #4d0000;
+  border-color: #e0443e;
+  background-color: #ff5f57;
+}
+
+headerbar button.titlebutton.minimize {
+  color: #6b4d00;
+  border-color: #dea123;
+  background-color: #febc2e;
+}
+
+headerbar button.titlebutton.maximize {
+  color: #064d13;
+  border-color: #12a025;
+  background-color: #28c840;
+}
+
+headerbar button.titlebutton:backdrop {
+  border-color: shade(@theme_bg_color, 0.78);
+  background-color: shade(@theme_bg_color, 0.82);
+}
+
+button {
+  min-height: 24px;
+  padding: 3px 10px;
+  border-radius: 6px;
+}
+
+button.small-button,
+button.image-button {
+  padding: 3px;
+}
+
+button.suggested-action {
+  border-color: shade(@theme_selected_bg_color, 0.88);
+  background-image: none;
+  background-color: @theme_selected_bg_color;
+}
+
+entry,
+spinbutton,
+combobox button,
+filechooserbutton button {
+  min-height: 26px;
+  border-radius: 6px;
+  box-shadow: inset 0 1px 2px alpha(black, 0.08);
+}
+
+popover {
+  padding: 6px;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px alpha(black, 0.22);
+}
+
+menu,
+.menu {
+  padding: 5px;
+  border-radius: 8px;
+}
+
+menuitem {
+  min-height: 22px;
+  padding: 3px 8px;
+  border-radius: 5px;
+}
+
+notebook > header {
+  padding: 3px 6px 0;
+  border-width: 0 0 1px;
+  border-style: solid;
+  border-color: @borders;
+  background-color: shade(@theme_bg_color, 0.97);
+}
+
+notebook > header > tabs > tab {
+  min-height: 26px;
+  padding: 3px 10px;
+  margin: 2px 2px 0;
+  border-width: 1px 1px 0;
+  border-style: solid;
+  border-color: transparent;
+  border-radius: 7px 7px 0 0;
+}
+
+notebook > header > tabs > tab:hover {
+  background-color: alpha(@theme_fg_color, 0.06);
+}
+
+notebook > header > tabs > tab:checked {
+  border-color: @borders;
+  background-color: @theme_bg_color;
+}
+
+.meld-notebook > header tab button.flat {
+  min-width: 16px;
+  min-height: 16px;
+  padding: 0;
+  border-radius: 999px;
+}
+
+.new-diff-title {
+  font-size: 220%;
+  font-weight: 300;
+  letter-spacing: 0.4px;
+}
+
+.new-diff-button {
+  min-width: 120px;
+  min-height: 82px;
+  padding: 12px;
+  border-radius: 10px;
+  box-shadow: 0 1px 2px alpha(black, 0.10);
+}
+
+.new-diff-button:checked {
+  border-color: @theme_selected_bg_color;
+  background-image: none;
+  background-color: alpha(@theme_selected_bg_color, 0.15);
+}
+
+.meld-actionbar > revealer > box,
+meld-find-bar,
+.meld-status-bar {
+  background-color: shade(@theme_bg_color, 0.98);
+}
+
+scrollbar slider {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+}

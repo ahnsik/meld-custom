@@ -8,6 +8,7 @@ BUILD_DIR="$SCRIPT_DIR/.build/meld-for-mac"
 APP_TEMPLATE="/Applications/Meld.app"
 APP_DIR="$SCRIPT_DIR/Meld_for_mac.app"
 PYTHON_PACKAGE="$APP_DIR/Contents/Resources/lib/python3.10/site-packages/meld"
+BUNDLED_PYTHON="$APP_DIR/Contents/Frameworks/Python.framework/Versions/3.10/Resources/Python.app/Contents/MacOS/Python"
 
 for command in meson ninja xmllint codesign rsync; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -64,7 +65,8 @@ PLIST="$APP_DIR/Contents/Info.plist"
     2>/dev/null ||
     /usr/libexec/PlistBuddy -c "Set :CFBundleName Meld_for_mac" "$PLIST"
 
-find "$APP_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
+env -u PYTHONDONTWRITEBYTECODE \
+    "$BUNDLED_PYTHON" -m compileall -q "$PYTHON_PACKAGE"
 codesign --force --deep --sign - "$APP_DIR"
 chmod 755 "$SCRIPT_DIR/meld_for_mac"
 

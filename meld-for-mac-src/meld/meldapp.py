@@ -18,6 +18,7 @@ import io
 import logging
 import optparse
 import os
+import sys
 
 from gi.repository import Gdk, Gio, GLib, Gtk
 
@@ -54,6 +55,19 @@ class MeldApp(Gtk.Application):
         Gtk.StyleContext.add_provider_for_screen(
             Gdk.Screen.get_default(), provider,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        if sys.platform == 'darwin':
+            settings = Gtk.Settings.get_default()
+            if settings:
+                settings.set_property(
+                    'gtk-decoration-layout', 'close,minimize,maximize:')
+
+            macos_provider = Gtk.CssProvider()
+            macos_provider.load_from_resource(
+                self.make_resource_path('macos.css'))
+            Gtk.StyleContext.add_provider_for_screen(
+                Gdk.Screen.get_default(), macos_provider,
+                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 1)
 
     def make_resource_path(self, resource_path: str) -> str:
         return f'{self.props.resource_base_path}/{resource_path}'

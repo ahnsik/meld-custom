@@ -12,6 +12,7 @@
 
     <child type="titlebar">
       <object class="GtkHeaderBar" id="header_bar">
+        <property name="decoration-layout">close,minimize,maximize:</property>
         <property name="show-close-button">true</property>
         <property name="visible">true</property>
         <property name="title">Meld_custom</property>

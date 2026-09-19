@@ -8,4 +8,5 @@ if [ ! -x "$MELD_APP" ]; then
     exit 127
 fi
 
+export PYTHONDONTWRITEBYTECODE=1
 exec "$MELD_APP" "$@"

@@ -28,6 +28,7 @@
     <signal name="response" handler="on_response" swapped="no"/>
     <child type="titlebar">
       <object class="GtkHeaderBar" id="header_bar">
+        <property name="decoration-layout">close:</property>
         <property name="title" translatable="yes">Preferences</property>
         <property name="visible">True</property>
         <property name="can_focus">False</property>
