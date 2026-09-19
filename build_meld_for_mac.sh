@@ -5,10 +5,10 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 SOURCE_DIR="$SCRIPT_DIR/meld-for-mac-src"
 BUILD_DIR="$SCRIPT_DIR/.build/meld-for-mac"
-APP_TEMPLATE="/Applications/Meld.app"
+OFFICIAL_APP_TEMPLATE="/Applications/Meld.app"
+INSTALLED_APP_TEMPLATE="/Applications/Meld_for_mac.app"
 APP_DIR="$SCRIPT_DIR/Meld_for_mac.app"
 PYTHON_PACKAGE="$APP_DIR/Contents/Resources/lib/python3.10/site-packages/meld"
-BUNDLED_PYTHON="$APP_DIR/Contents/Frameworks/Python.framework/Versions/3.10/Resources/Python.app/Contents/MacOS/Python"
 
 for command in meson ninja xmllint codesign rsync; do
     if ! command -v "$command" >/dev/null 2>&1; then
@@ -17,8 +17,12 @@ for command in meson ninja xmllint codesign rsync; do
     fi
 done
 
-if [ ! -d "$APP_TEMPLATE" ]; then
-    echo "build_meld_for_mac: $APP_TEMPLATE 이 필요합니다." >&2
+if [ -d "$OFFICIAL_APP_TEMPLATE" ]; then
+    APP_TEMPLATE="$OFFICIAL_APP_TEMPLATE"
+elif [ -d "$INSTALLED_APP_TEMPLATE" ]; then
+    APP_TEMPLATE="$INSTALLED_APP_TEMPLATE"
+else
+    echo "build_meld_for_mac: Meld 런타임 템플릿이 필요합니다." >&2
     echo "brew install --cask meld" >&2
     exit 127
 fi
@@ -64,9 +68,13 @@ PLIST="$APP_DIR/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Add :CFBundleName string Meld_for_mac" "$PLIST" \
     2>/dev/null ||
     /usr/libexec/PlistBuddy -c "Set :CFBundleName Meld_for_mac" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :LSEnvironment dict" "$PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy \
+    -c "Add :LSEnvironment:PYTHONDONTWRITEBYTECODE string 1" "$PLIST" \
+    2>/dev/null ||
+    /usr/libexec/PlistBuddy \
+        -c "Set :LSEnvironment:PYTHONDONTWRITEBYTECODE 1" "$PLIST"
 
-env -u PYTHONDONTWRITEBYTECODE \
-    "$BUNDLED_PYTHON" -m compileall -q "$PYTHON_PACKAGE"
 codesign --force --deep --sign - "$APP_DIR"
 chmod 755 "$SCRIPT_DIR/meld_for_mac"
 
