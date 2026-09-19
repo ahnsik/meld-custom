@@ -1,0 +1,6 @@
+*.pyc
+*.orig
+*.rej
+*.desktop
+*.install
+data/mime/meld.xml
