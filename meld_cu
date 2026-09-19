@@ -3,7 +3,7 @@
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 if command -v python3 >/dev/null 2>&1; then
-    exec python3 "$SCRIPT_DIR/meld-cu-src/bin/meld" "$@"
+    exec python3 "$SCRIPT_DIR/bin/meld" "$@"
 fi
 
 echo "meld_cu: Python 3가 필요합니다." >&2
